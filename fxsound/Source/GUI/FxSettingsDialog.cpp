@@ -31,6 +31,8 @@ FxSettingsDialog::FxSettingsDialog() : FxWindow("Settings"), tooltip_window_(thi
 
 void FxSettingsDialog::closeButtonPressed()
 {
+	FxController::getInstance().setBrickwallFilterPreviewOn(false);
+
 	exitModalState(0);
 	removeFromDesktop();
 }
@@ -185,6 +187,11 @@ void FxSettingsDialog::SettingsPane::paint(Graphics&)
 FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	SettingsPane("Audio"),
 	prioritize_new_output_toggle_(TRANS("Prioritize new output devices")),
+	brickwall_filter_toggle_(TRANS("Brickwall Filter (20Hz - 20kHz)")),
+	brickwall_gentle_toggle_(TRANS("Gentle (~12 dB/octave)")),
+	brickwall_standard_toggle_(TRANS("Standard (~48 dB/octave)")),
+	brickwall_steep_toggle_(TRANS("Steep (~96 dB/octave)")),
+	brickwall_preview_button_(TRANS("Hear What's Removed")),
 	reset_presets_button_(TRANS("Reset presets to factory defaults"))
 {
 	setFocusContainer(true);
@@ -206,6 +213,53 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 
 	prioritize_new_output_toggle_.setToggleState(FxController::getInstance().isNewOutputPrioritized(), NotificationType::dontSendNotification);
 	prioritize_new_output_toggle_.onClick = [this]() { FxController::getInstance().setNewOutputPrioritized(prioritize_new_output_toggle_.getToggleState()); };
+
+	brickwall_filter_title_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+	brickwall_filter_title_.setJustificationType(Justification::centredLeft);
+
+	brickwall_filter_toggle_.setMouseCursor(MouseCursor::PointingHandCursor);
+	brickwall_filter_toggle_.setColour(ToggleButton::ColourIds::tickColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+	brickwall_filter_toggle_.setColour(ToggleButton::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+	brickwall_filter_toggle_.setWantsKeyboardFocus(true);
+	brickwall_filter_toggle_.setToggleState(FxController::getInstance().isBrickwallFilterOn(), NotificationType::dontSendNotification);
+	brickwall_filter_toggle_.onClick = [this]() {
+		FxController::getInstance().setBrickwallFilterOn(brickwall_filter_toggle_.getToggleState());
+		updateBrickwallControlsEnabled();
+		};
+
+	brickwall_gentle_toggle_.setTooltip(TRANS("Gentlest rolloff. Lowest CPU use, but lets more content below 20Hz and above 20kHz through."));
+	brickwall_standard_toggle_.setTooltip(TRANS("Balanced rolloff and CPU use. Recommended for most listening."));
+	brickwall_steep_toggle_.setTooltip(TRANS("Steepest rolloff and closest to a true brickwall, at the cost of more CPU use and more phase distortion right at the edges of the band."));
+
+	for (auto* steepness_toggle : { &brickwall_gentle_toggle_, &brickwall_standard_toggle_, &brickwall_steep_toggle_ })
+	{
+		steepness_toggle->setMouseCursor(MouseCursor::PointingHandCursor);
+		steepness_toggle->setColour(ToggleButton::ColourIds::tickColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+		steepness_toggle->setColour(ToggleButton::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+		steepness_toggle->setWantsKeyboardFocus(true);
+		steepness_toggle->setRadioGroupId(BRICKWALL_STEEPNESS_RADIO_GROUP_ID);
+	}
+
+	auto current_steepness = FxController::getInstance().getBrickwallFilterSteepness();
+	brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
+	brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
+	brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
+
+	brickwall_gentle_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Gentle); };
+	brickwall_standard_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Standard); };
+	brickwall_steep_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Steep); };
+
+	brickwall_preview_button_.setClickingTogglesState(true);
+	brickwall_preview_button_.setMouseCursor(MouseCursor::PointingHandCursor);
+	brickwall_preview_button_.setTooltip(TRANS("Plays back only the content the filter is removing, so you can hear what it affects."));
+	brickwall_preview_button_.onClick = [this]() {
+		auto& controller = FxController::getInstance();
+		bool preview_on = brickwall_preview_button_.getToggleState();
+		controller.setBrickwallFilterPreviewOn(preview_on);
+		brickwall_preview_button_.setButtonText(preview_on ? TRANS("Stop Previewing") : TRANS("Hear What's Removed"));
+		};
+
+	updateBrickwallControlsEnabled();
 
 	auto preset_modified = false;
 	auto preset_count = FxModel::getModel().getPresetCount();
@@ -231,7 +285,29 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	addAndMakeVisible(&output_preference_title_);
 	addAndMakeVisible(&output_preference_);
 	addAndMakeVisible(&prioritize_new_output_toggle_);
+	addAndMakeVisible(&brickwall_filter_title_);
+	addAndMakeVisible(&brickwall_filter_toggle_);
+	addAndMakeVisible(&brickwall_gentle_toggle_);
+	addAndMakeVisible(&brickwall_standard_toggle_);
+	addAndMakeVisible(&brickwall_steep_toggle_);
+	addAndMakeVisible(&brickwall_preview_button_);
 	addAndMakeVisible(&reset_presets_button_);
+}
+
+void FxSettingsDialog::AudioSettingsPane::updateBrickwallControlsEnabled()
+{
+	bool filter_on = brickwall_filter_toggle_.getToggleState();
+
+	brickwall_gentle_toggle_.setEnabled(filter_on);
+	brickwall_standard_toggle_.setEnabled(filter_on);
+	brickwall_steep_toggle_.setEnabled(filter_on);
+	brickwall_preview_button_.setEnabled(filter_on);
+
+	if (!filter_on && brickwall_preview_button_.getToggleState())
+	{
+		brickwall_preview_button_.setToggleState(false, NotificationType::dontSendNotification);
+		brickwall_preview_button_.setButtonText(TRANS("Hear What's Removed"));
+	}
 }
 
 FxSettingsDialog::AudioSettingsPane::~AudioSettingsPane()
@@ -258,6 +334,26 @@ void FxSettingsDialog::AudioSettingsPane::resized()
 	output_preference_bounds_ = juce::Rectangle<float>(group_x, group_y, group_width, group_height);
 
 	y = prioritize_new_output_toggle_.getBottom() + 30;
+	brickwall_filter_title_.setBounds(X_MARGIN, y, LABEL_WIDTH, LABEL_HEIGHT);
+
+	y = brickwall_filter_title_.getBottom() + 10;
+	brickwall_filter_toggle_.setBounds(X_MARGIN, y, width, TOGGLE_BUTTON_HEIGHT);
+
+	y = brickwall_filter_toggle_.getBottom() + 5;
+	auto steepness_indent = X_MARGIN + 20;
+	auto steepness_width = width - 20;
+	brickwall_gentle_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+
+	y = brickwall_gentle_toggle_.getBottom() + 5;
+	brickwall_standard_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+
+	y = brickwall_standard_toggle_.getBottom() + 5;
+	brickwall_steep_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+
+	y = brickwall_steep_toggle_.getBottom() + 10;
+	brickwall_preview_button_.setBounds(steepness_indent, y, RESET_PRESETS_BUTTON_WIDTH, BUTTON_HEIGHT);
+
+	y = brickwall_preview_button_.getBottom() + 30;
 	resizeResetButton(X_MARGIN, y);
 }
 
@@ -281,6 +377,13 @@ void FxSettingsDialog::AudioSettingsPane::setText()
 	output_preference_title_.setText(TRANS("Output Device Preference"), NotificationType::dontSendNotification);
 
 	prioritize_new_output_toggle_.setButtonText(TRANS("Prioritize new output devices"));
+
+	brickwall_filter_title_.setFont(theme.getNormalFont());
+	brickwall_filter_title_.setText(TRANS("Bandwidth Filter"), NotificationType::dontSendNotification);
+	brickwall_filter_toggle_.setButtonText(TRANS("Brickwall Filter (20Hz - 20kHz)"));
+	brickwall_gentle_toggle_.setButtonText(TRANS("Gentle (~12 dB/octave)"));
+	brickwall_standard_toggle_.setButtonText(TRANS("Standard (~48 dB/octave)"));
+	brickwall_steep_toggle_.setButtonText(TRANS("Steep (~96 dB/octave)"));
 
 	reset_presets_button_.setButtonText(TRANS("Reset presets to factory defaults"));
 	resizeResetButton(reset_presets_button_.getX(), reset_presets_button_.getY());

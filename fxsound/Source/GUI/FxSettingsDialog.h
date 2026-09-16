@@ -107,9 +107,11 @@ private:
 		static constexpr int RESET_PRESETS_BUTTON_WIDTH = 220;
 		static constexpr int BUTTON_HEIGHT = 24;
 		static constexpr int MAX_BUTTON_WIDTH = 315;
+		static constexpr int BRICKWALL_STEEPNESS_RADIO_GROUP_ID = 1;
 
 		void setText();
 		void resizeResetButton(int x, int y);
+		void updateBrickwallControlsEnabled();
 
 		void visibilityChanged() override;
 		void mouseEnter(const MouseEvent& mouse_event) override;
@@ -118,6 +120,13 @@ private:
 		Label output_preference_title_;
 		FxOutputPreference output_preference_;
 		ToggleButton prioritize_new_output_toggle_;
+
+		Label brickwall_filter_title_;
+		ToggleButton brickwall_filter_toggle_;
+		ToggleButton brickwall_gentle_toggle_;
+		ToggleButton brickwall_standard_toggle_;
+		ToggleButton brickwall_steep_toggle_;
+		TextButton brickwall_preview_button_;
 
 		TextButton reset_presets_button_;
 
@@ -188,7 +197,7 @@ private:
 	{
 	public:
         static constexpr int WIDTH = 600;
-        static constexpr int HEIGHT = 510;
+        static constexpr int HEIGHT = 660;
 
 		SettingsComponent();
         ~SettingsComponent() = default;
