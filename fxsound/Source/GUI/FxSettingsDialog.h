@@ -126,6 +126,7 @@ private:
 		ToggleButton brickwall_gentle_toggle_;
 		ToggleButton brickwall_standard_toggle_;
 		ToggleButton brickwall_steep_toggle_;
+		ToggleButton brickwall_ultra_steep_toggle_;
 		TextButton brickwall_preview_button_;
 
 		TextButton reset_presets_button_;
@@ -197,7 +198,7 @@ private:
 	{
 	public:
         static constexpr int WIDTH = 600;
-        static constexpr int HEIGHT = 660;
+        static constexpr int HEIGHT = 695;
 
 		SettingsComponent();
         ~SettingsComponent() = default;

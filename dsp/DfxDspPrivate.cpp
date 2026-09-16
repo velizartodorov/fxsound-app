@@ -70,6 +70,8 @@ static int brickwallNumSectionsForSteepness(DfxDsp::BrickwallSteepness steepness
 		return 1;
 	case DfxDsp::BrickwallSteepness::Steep:
 		return 8;
+	case DfxDsp::BrickwallSteepness::UltraSteep:
+		return 11;
 	case DfxDsp::BrickwallSteepness::Standard:
 	default:
 		return 4;
@@ -100,7 +102,8 @@ static void debugVerifyBrickwallFilterResponse()
 	const DfxDsp::BrickwallSteepness steepness_values[] = {
 		DfxDsp::BrickwallSteepness::Gentle,
 		DfxDsp::BrickwallSteepness::Standard,
-		DfxDsp::BrickwallSteepness::Steep
+		DfxDsp::BrickwallSteepness::Steep,
+		DfxDsp::BrickwallSteepness::UltraSteep
 	};
 	size_t rate_index, steepness_index;
 
@@ -346,7 +349,7 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 	num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
 
 	// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
-	// 1/4/8, but filtBrickwallProcessSample() does not itself bounds-check
+	// 1/4/8/11, but filtBrickwallProcessSample() does not itself bounds-check
 	// i_num_sections against FILT_BRICKWALL_MAX_SECTIONS before indexing into
 	// fixed-size arrays (Task 1 library code is generic and doesn't know
 	// about steepness policy). Clamp here, in the real-time audio path, as a

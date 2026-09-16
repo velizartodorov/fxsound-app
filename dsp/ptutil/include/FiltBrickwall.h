@@ -22,7 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 /* Maximum audio channels and cascaded 2nd-order sections per band this module supports. */
 #define FILT_BRICKWALL_MAX_CHANNELS  8
-#define FILT_BRICKWALL_MAX_SECTIONS  8
+#define FILT_BRICKWALL_MAX_SECTIONS  11
 
 /* Coefficients for one 2nd-order Butterworth section, produced by
  * filtBrickwallDesignHighPass()/filtBrickwallDesignLowPass() below (a bilinear-

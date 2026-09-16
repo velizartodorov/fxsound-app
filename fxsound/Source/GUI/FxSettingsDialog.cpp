@@ -191,6 +191,7 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	brickwall_gentle_toggle_(TRANS("Gentle (~12 dB/octave)")),
 	brickwall_standard_toggle_(TRANS("Standard (~48 dB/octave)")),
 	brickwall_steep_toggle_(TRANS("Steep (~96 dB/octave)")),
+	brickwall_ultra_steep_toggle_(TRANS("Ultra Steep (~132 dB/octave)")),
 	brickwall_preview_button_(TRANS("Hear What's Removed")),
 	reset_presets_button_(TRANS("Reset presets to factory defaults"))
 {
@@ -229,9 +230,10 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 
 	brickwall_gentle_toggle_.setTooltip(TRANS("Gentlest rolloff. Lowest CPU use, but lets more content below 20Hz and above 20kHz through."));
 	brickwall_standard_toggle_.setTooltip(TRANS("Balanced rolloff and CPU use. Recommended for most listening."));
-	brickwall_steep_toggle_.setTooltip(TRANS("Steepest rolloff and closest to a true brickwall, at the cost of more CPU use and more phase distortion right at the edges of the band."));
+	brickwall_steep_toggle_.setTooltip(TRANS("Steep rolloff, at the cost of more CPU use and more phase distortion right at the edges of the band."));
+	brickwall_ultra_steep_toggle_.setTooltip(TRANS("Steepest rolloff and closest to a true brickwall, at the cost of the most CPU use and the most phase distortion right at the edges of the band."));
 
-	for (auto* steepness_toggle : { &brickwall_gentle_toggle_, &brickwall_standard_toggle_, &brickwall_steep_toggle_ })
+	for (auto* steepness_toggle : { &brickwall_gentle_toggle_, &brickwall_standard_toggle_, &brickwall_steep_toggle_, &brickwall_ultra_steep_toggle_ })
 	{
 		steepness_toggle->setMouseCursor(MouseCursor::PointingHandCursor);
 		steepness_toggle->setColour(ToggleButton::ColourIds::tickColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
@@ -244,10 +246,12 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
 	brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
 	brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
+	brickwall_ultra_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::UltraSteep, NotificationType::dontSendNotification);
 
 	brickwall_gentle_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Gentle); };
 	brickwall_standard_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Standard); };
 	brickwall_steep_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Steep); };
+	brickwall_ultra_steep_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::UltraSteep); };
 
 	brickwall_preview_button_.setClickingTogglesState(true);
 	brickwall_preview_button_.setMouseCursor(MouseCursor::PointingHandCursor);
@@ -290,6 +294,7 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	addAndMakeVisible(&brickwall_gentle_toggle_);
 	addAndMakeVisible(&brickwall_standard_toggle_);
 	addAndMakeVisible(&brickwall_steep_toggle_);
+	addAndMakeVisible(&brickwall_ultra_steep_toggle_);
 	addAndMakeVisible(&brickwall_preview_button_);
 	addAndMakeVisible(&reset_presets_button_);
 }
@@ -301,6 +306,7 @@ void FxSettingsDialog::AudioSettingsPane::updateBrickwallControlsEnabled()
 	brickwall_gentle_toggle_.setEnabled(filter_on);
 	brickwall_standard_toggle_.setEnabled(filter_on);
 	brickwall_steep_toggle_.setEnabled(filter_on);
+	brickwall_ultra_steep_toggle_.setEnabled(filter_on);
 	brickwall_preview_button_.setEnabled(filter_on);
 
 	if (!filter_on && brickwall_preview_button_.getToggleState())
@@ -350,7 +356,10 @@ void FxSettingsDialog::AudioSettingsPane::resized()
 	y = brickwall_standard_toggle_.getBottom() + 5;
 	brickwall_steep_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
 
-	y = brickwall_steep_toggle_.getBottom() + 10;
+	y = brickwall_steep_toggle_.getBottom() + 5;
+	brickwall_ultra_steep_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+
+	y = brickwall_ultra_steep_toggle_.getBottom() + 10;
 	brickwall_preview_button_.setBounds(steepness_indent, y, RESET_PRESETS_BUTTON_WIDTH, BUTTON_HEIGHT);
 
 	y = brickwall_preview_button_.getBottom() + 30;
@@ -384,6 +393,7 @@ void FxSettingsDialog::AudioSettingsPane::setText()
 	brickwall_gentle_toggle_.setButtonText(TRANS("Gentle (~12 dB/octave)"));
 	brickwall_standard_toggle_.setButtonText(TRANS("Standard (~48 dB/octave)"));
 	brickwall_steep_toggle_.setButtonText(TRANS("Steep (~96 dB/octave)"));
+	brickwall_ultra_steep_toggle_.setButtonText(TRANS("Ultra Steep (~132 dB/octave)"));
 
 	reset_presets_button_.setButtonText(TRANS("Reset presets to factory defaults"));
 	resizeResetButton(reset_presets_button_.getX(), reset_presets_button_.getY());
@@ -431,6 +441,7 @@ void FxSettingsDialog::AudioSettingsPane::visibilityChanged()
 		brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
 		brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
 		brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
+		brickwall_ultra_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::UltraSteep, NotificationType::dontSendNotification);
 
 		bool preview_on = controller.isBrickwallFilterPreviewOn();
 		brickwall_preview_button_.setToggleState(preview_on, NotificationType::dontSendNotification);

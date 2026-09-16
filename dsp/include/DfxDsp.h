@@ -36,7 +36,7 @@ class DfxDsp
 {
 public:
 	enum Effect { Fidelity = 0, Ambience = 1, Surround = 2, DynamicBoost = 3, Bass = 4, NumEffects = 5 };
-	enum BrickwallSteepness { Gentle = 0, Standard = 1, Steep = 2 };
+	enum BrickwallSteepness { Gentle = 0, Standard = 1, Steep = 2, UltraSteep = 3 };
 
 	DfxDsp();
 	~DfxDsp();
