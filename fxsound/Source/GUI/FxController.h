@@ -148,6 +148,13 @@ public:
 	bool isAlwaysOnTop();
 	void setAlwaysOnTop(bool always_on_top);
 
+	bool isBrickwallFilterOn();
+	void setBrickwallFilterOn(bool on);
+	DfxDsp::BrickwallSteepness getBrickwallFilterSteepness();
+	void setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness);
+	bool isBrickwallFilterPreviewOn();
+	void setBrickwallFilterPreviewOn(bool on);
+
 	bool isLaunchOnStartup();
 	void setLaunchOnStartup(bool launch_on_startup);
 

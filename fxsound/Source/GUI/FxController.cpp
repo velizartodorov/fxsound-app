@@ -743,6 +743,9 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 			path.createDirectory();
 		}
 
+		setBrickwallFilterSteepness(static_cast<DfxDsp::BrickwallSteepness>(settings_.getInt("brickwall_filter_steepness", static_cast<int>(DfxDsp::BrickwallSteepness::Standard))));
+		setBrickwallFilterOn(settings_.getBool("brickwall_filter_on"));
+
 		setPowerState(settings_.getBool("power"));
 
 		initPresets();
@@ -1738,6 +1741,7 @@ void FxController::powerOn(bool on)
 	else
 	{
 		dfx_dsp_.powerOn(false);
+		dfx_dsp_.brickwallFilterPreviewOn(false);
 
 		if (isTimerRunning())
 		{
@@ -2792,6 +2796,43 @@ void FxController::setAlwaysOnTop(bool always_on_top)
 	always_on_top_ = always_on_top;
 	settings_.setBool("always_on_top", always_on_top);
 	main_window_->setAlwaysOnTop(always_on_top);
+}
+
+bool FxController::isBrickwallFilterOn()
+{
+	return dfx_dsp_.isBrickwallFilterOn();
+}
+
+void FxController::setBrickwallFilterOn(bool on)
+{
+	dfx_dsp_.brickwallFilterOn(on);
+	settings_.setBool("brickwall_filter_on", on);
+
+	if (!on)
+	{
+		dfx_dsp_.brickwallFilterPreviewOn(false);
+	}
+}
+
+DfxDsp::BrickwallSteepness FxController::getBrickwallFilterSteepness()
+{
+	return dfx_dsp_.getBrickwallFilterSteepness();
+}
+
+void FxController::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
+{
+	dfx_dsp_.setBrickwallFilterSteepness(steepness);
+	settings_.setInt("brickwall_filter_steepness", static_cast<int>(steepness));
+}
+
+bool FxController::isBrickwallFilterPreviewOn()
+{
+	return dfx_dsp_.isBrickwallFilterPreviewOn();
+}
+
+void FxController::setBrickwallFilterPreviewOn(bool on)
+{
+	dfx_dsp_.brickwallFilterPreviewOn(on);
 }
 
 bool FxController::isLaunchOnStartup()
