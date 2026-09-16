@@ -422,6 +422,21 @@ void FxSettingsDialog::AudioSettingsPane::visibilityChanged()
 	if (isVisible())
 	{
 		output_preference_.update();
+
+		auto& controller = FxController::getInstance();
+
+		brickwall_filter_toggle_.setToggleState(controller.isBrickwallFilterOn(), NotificationType::dontSendNotification);
+
+		auto current_steepness = controller.getBrickwallFilterSteepness();
+		brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
+		brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
+		brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
+
+		bool preview_on = controller.isBrickwallFilterPreviewOn();
+		brickwall_preview_button_.setToggleState(preview_on, NotificationType::dontSendNotification);
+		brickwall_preview_button_.setButtonText(preview_on ? TRANS("Stop Previewing") : TRANS("Hear What's Removed"));
+
+		updateBrickwallControlsEnabled();
     }
 }
 
