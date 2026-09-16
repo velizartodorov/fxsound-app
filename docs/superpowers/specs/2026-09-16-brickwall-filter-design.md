@@ -49,21 +49,53 @@ This filter has no split/recombine step — it's a single series path
 (high-pass then low-pass) — so LR's defining advantage does not apply.
 The filter uses a Butterworth-based cascade.
 
-**Cascade approximation vs. true higher-order Butterworth.** The existing
+**Cascade approximation vs. true higher-order Butterworth.** A textbook
+N-th-order Butterworth requires cascading N/2 stages each with a
+*different* Q (per the standard Butterworth pole-angle layout). This
+design instead cascades multiple *identical* fixed-Q (~0.707) stages at a
+calibrated cutoff (see "Cutoff placement correction" below). This is a
+deliberate approximation: steeper-than-single-stage rejection far from
+cutoff, with a rolloff that is only asymptotically N×12dB/octave and a
+passband shape that isn't textbook-flat. This was accepted because
+implementing true per-stage-Q design would add meaningfully more
+coefficient-design code for a difference that isn't perceptible in
+practice once the cascade's actual -3dB point is correctly placed.
+
+**Cutoff placement correction (post-implementation fix).** The first
+implementation designed each cascaded section directly at the nominal
+20Hz/20kHz target using this codebase's existing
 `filtDesign2ndButLowPass`/`filtDesign2ndButHighPass` functions
-(`dsp/ptutil/Filt/Fil12But.cpp`) implement a fixed-Q (~0.707) 2nd-order
-Butterworth design with no Q parameter. A textbook N-th-order Butterworth
-requires cascading N/2 stages each with a *different* Q (per the standard
-Butterworth pole-angle layout). This design instead cascades multiple
-*identical* fixed-Q stages at the same cutoff. This is a deliberate
-approximation: steeper-than-single-stage rejection far from cutoff, with
-some passband droop starting below the nominal cutoff and a rolloff that
-is only asymptotically N×12dB/octave. This was chosen because:
-- It reuses existing, already-tested coefficient-design code as-is.
-- The droop and imprecision are concentrated at 20Hz/20kHz — the edges of
-  human hearing — where they are inaudible in practice.
-- Implementing true per-stage-Q design would add new coefficient-design
-  code for a difference that doesn't matter at these specific cutoffs.
+(`dsp/ptutil/Filt/Fil12But.cpp`). Real-world listening then found Standard
+and Steep removed far more treble than intended. Numeric verification
+(not hand calculation) found two compounding problems:
+1. `filtDesign2ndButLowPass`/`HighPass` use an unwarped frequency mapping
+   (`r_omega = 2*PI*fc/fs`) that was written for filters used well below
+   Nyquist elsewhere in this codebase (e.g. a 150Hz crossover in
+   `Play32Butter.c`) and is badly inaccurate this close to Nyquist: a
+   single section "targeting" 20kHz at 44.1kHz actually placed its -3dB
+   point around 13.5kHz.
+2. Cascading N identical sections shifts the cascade's actual -3dB point
+   further away from each section's own -3dB point (compounding
+   attenuation), worsening the error again.
+
+The fix has two parts:
+- Replaced the coefficient design with the standard bilinear-transform
+  ("RBJ cookbook") Butterworth biquad formula, verified numerically to
+  land exactly on the target -3dB frequency at any point up to Nyquist.
+  The real-time run path (`filtRun2ndLowPass`/`filtRun2ndHighPass`) is
+  unchanged — only how coefficients are computed.
+- Added `filtBrickwallCalibrateCascadeCutoff()`, a numeric (bisection)
+  search for the per-section design frequency that makes an N-section
+  cascade land its actual -3dB exactly at the 20Hz/20kHz target. A
+  closed-form correction factor derived from the idealized continuous-time
+  Butterworth cascade formula was tried first and found unreliable — it
+  undercorrects near Nyquist at 44.1/48kHz and overcorrects at higher
+  sample rates, because the real bilinear-transformed section shape
+  deviates from that idealized assumption as the design frequency changes.
+  The numeric search verifies the actual cascade response directly, so it
+  is correct at any sample rate and section count. It runs only on the
+  control thread (steepness change, sample rate change) — never in the
+  real-time audio path.
 
 **Linear phase.** The filter is IIR and therefore not linear-phase; phase
 distortion is concentrated in the transition bands around 20Hz and 20kHz,
@@ -75,14 +107,15 @@ tool.
 
 ## Steepness presets
 
-Three presets, each a cascade of N identical 2nd-order Butterworth
+Four presets, each a cascade of N identical 2nd-order Butterworth
 sections per band (high-pass at 20Hz, low-pass at 20kHz), run in series:
 
-| Preset   | Sections/band | Asymptotic rolloff |
-|----------|---------------|---------------------|
-| Gentle   | 1             | ~12 dB/octave       |
-| Standard | 4             | ~48 dB/octave (default steepness value when the filter is enabled) |
-| Steep    | 8             | ~96 dB/octave       |
+| Preset      | Sections/band | Asymptotic rolloff |
+|-------------|---------------|---------------------|
+| Gentle      | 1             | ~12 dB/octave       |
+| Standard    | 4             | ~48 dB/octave (default steepness value when the filter is enabled) |
+| Steep       | 8             | ~96 dB/octave       |
+| Ultra Steep | 11            | ~132 dB/octave (added after initial release, on request; 128 dB/octave isn't achievable exactly since each section contributes 12 dB/octave — 11 sections is the closest match) |
 
 ## Architecture
 
@@ -189,12 +222,18 @@ persist via `settings_`, following the exact pattern of
   crash). The brickwall filter is skipped there too, consistent with
   every other effect.
 - **44.1kHz Nyquist proximity**: at 44.1kHz, 20kHz is 90.7% of Nyquist
-  (22.05kHz). The existing unwarped Butterworth design formula used
-  elsewhere in this codebase (e.g. `Play32Butter.c`,
-  `r_omega = 2*PI*fc/fs`) has known frequency-placement error as fc
-  approaches Nyquist. This will be verified during implementation (see
-  Testing) and the target frequency adjusted if needed so the actual
-  -3dB point lands close to 20kHz at 44.1/48kHz.
+  (22.05kHz). Resolved by the bilinear-transform design + numeric
+  calibration search described in "Cutoff placement correction" above —
+  verified to land the cascade's actual -3dB point within 0.2dB of the
+  20kHz target (and within a wider, float32-precision-limited tolerance
+  for the 20Hz target, still far tighter than what's audible) at 44.1kHz,
+  48kHz, and 96kHz, for all three steepness presets.
+- **Preview signal removing more at steeper presets**: expected, not a
+  bug — the preview plays back exactly what the filter removes, and a
+  steeper preset suppresses content outside 20Hz-20kHz more aggressively
+  by design, so its residual signal is legitimately larger. Confirmed via
+  real-world listening that normal playback (preview off) sounds
+  equivalent across all three presets, as intended.
 - **Sample rate / channel count changes**: trigger a coefficient/state
   recompute, using the same `setSignalFormat` lifecycle already in place.
 
@@ -210,7 +249,7 @@ persist via `settings_`, following the exact pattern of
   virtual audio driver already installed, per this repo's CLAUDE.md), and
   in the Settings dialog:
   - Toggle the filter on/off and confirm passthrough audio still works.
-  - Switch between the three steepness presets and confirm tooltips
+  - Switch between the four steepness presets and confirm tooltips
     display correctly.
   - Toggle preview on and confirm it plays back only very quiet
     removed-content audio, and that it reverts to normal output when
