@@ -77,6 +77,71 @@ int DfxDsp::getNumEqBands()
 	return data_->getNumEqBands();
 }
 
+void DfxDsp::brickwallFilterOn(bool on)
+{
+	data_->brickwallFilterOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterOn()
+{
+	return data_->isBrickwallFilterOn();
+}
+
+void DfxDsp::setBrickwallFilterSteepness(BrickwallSteepness steepness)
+{
+	data_->setBrickwallFilterSteepness(steepness);
+}
+
+DfxDsp::BrickwallSteepness DfxDsp::getBrickwallFilterSteepness()
+{
+	return data_->getBrickwallFilterSteepness();
+}
+
+void DfxDsp::brickwallFilterPreviewOn(bool on)
+{
+	data_->brickwallFilterPreviewOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterPreviewOn()
+{
+	return data_->isBrickwallFilterPreviewOn();
+}
+
+void DfxDsp::brickwallFilterLinearPhaseOn(bool on)
+{
+	data_->brickwallFilterLinearPhaseOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterLinearPhaseOn()
+{
+	return data_->isBrickwallFilterLinearPhaseOn();
+}
+
+double DfxDsp::getBrickwallFilterLatencyMs()
+{
+	return data_->getBrickwallFilterLatencyMs();
+}
+
+void DfxDsp::setBrickwallFilterLinearPhaseLatency(BrickwallLinearPhaseLatency latency)
+{
+	data_->setBrickwallFilterLinearPhaseLatency(latency);
+}
+
+DfxDsp::BrickwallLinearPhaseLatency DfxDsp::getBrickwallFilterLinearPhaseLatency()
+{
+	return data_->getBrickwallFilterLinearPhaseLatency();
+}
+
+void DfxDsp::setBrickwallFilterHighPassCutoff(float cutoff_hz)
+{
+	data_->setBrickwallFilterHighPassCutoff(cutoff_hz);
+}
+
+float DfxDsp::getBrickwallFilterHighPassCutoff()
+{
+	return data_->getBrickwallFilterHighPassCutoff();
+}
+
 DfxPreset DfxDsp::getPresetInfo(std::wstring preset_file_full_path)
 {
 	return data_->getPresetInfo(preset_file_full_path);

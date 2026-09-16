@@ -153,8 +153,10 @@ void FxTheme::drawComboBox(Graphics& g, int width, int height, bool,
 		g.drawRoundedRectangle(boxBounds.toFloat().reduced(0.5f, 0.5f), cornerSize, 1.0f);
 	}
 	
+	// Narrow boxes (up to the EQ settings page's 160px band selector) keep
+	// their arrow closer to the right edge.
 	int margin = 32;
-	if (width <= 150)
+	if (width <= 160)
         margin = 24;
 
 	g.setColour(box.findColour(ComboBox::arrowColourId).withAlpha((box.isEnabled() ? 1.0f : 0.2f)));

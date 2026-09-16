@@ -255,6 +255,10 @@
     <ClInclude Include="ptutil\include\dspfxp_studioverb.h" />
     <ClInclude Include="ptutil\include\dynamic_build_defines.h" />
     <ClInclude Include="ptutil\include\filt.h" />
+    <ClInclude Include="ptutil\include\FiltBrickwall.h" />
+    <ClInclude Include="ptutil\include\FiltBrickwallFir.h" />
+    <ClInclude Include="ptutil\include\FiltPartConv.h" />
+    <ClInclude Include="ptutil\pffft\pffft.h" />
     <ClInclude Include="ptutil\include\GraphicEq.h" />
     <ClInclude Include="ptutil\include\midi.h" />
     <ClInclude Include="ptutil\include\platform.h" />
@@ -354,6 +358,26 @@
     <ClCompile Include="ptutil\DspUtil\SurroundSyn\SurroundSynInit.cpp" />
     <ClCompile Include="ptutil\DspUtil\SurroundSyn\SurroundSynProcess.cpp" />
     <ClCompile Include="ptutil\Filt\Fil12But.cpp" />
+    <ClCompile Include="ptutil\Filt\FiltBrickwall.cpp" />
+    <ClCompile Include="ptutil\Filt\FiltBrickwallFir.cpp" />
+    <ClCompile Include="ptutil\Filt\FiltPartConv.cpp" />
+    <ClCompile Include="ptutil\pffft\pffft.c">
+      <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">MaxSpeed</Optimization>
+      <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">MaxSpeed</Optimization>
+      <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">MaxSpeed</Optimization>
+      <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Default</BasicRuntimeChecks>
+      <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Default</BasicRuntimeChecks>
+      <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Default</BasicRuntimeChecks>
+      <DebugInformationFormat Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">ProgramDatabase</DebugInformationFormat>
+      <DebugInformationFormat Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">ProgramDatabase</DebugInformationFormat>
+      <DebugInformationFormat Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">ProgramDatabase</DebugInformationFormat>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">false</SDLCheck>
+    </ClCompile>
     <ClCompile Include="ptutil\Filt\FiltbiqdSos.cpp" />
     <ClCompile Include="ptutil\Filt\FiltCalcBiqd.cpp" />
     <ClCompile Include="ptutil\Filt\FiltCalcFilterResponse.cpp" />

@@ -95,7 +95,8 @@ void FxProView::resized()
     auto bounds = getLocalBounds();
 
 	audio_controls_.setBounds(audio_controls_.getBounds().withX(AUDIO_X).withY(AUDIO_Y+visualizer_offset));
-	equalizer_.setBounds(equalizer_.getBounds().withX(audio_controls_.getRight() + 16).withY(AUDIO_Y+visualizer_offset));
+	auto equalizer_x = audio_controls_.getRight() + 16;
+	equalizer_.setBounds(equalizer_x, AUDIO_Y + visualizer_offset, EQUALIZER_RIGHT - equalizer_x, equalizer_.getHeight());
 }
 
 void FxProView::paint(Graphics& g)
@@ -134,6 +135,13 @@ void FxProView::modelChanged(FxModel::Event model_event)
 	if (model_event == FxModel::Event::PresetSelected)
 	{
 		update();
+	}
+	else if (model_event == FxModel::Event::Other)
+	{
+		// Power state changes, and the controller stopping the bandwidth
+		// filter preview, arrive as Other: resync controls such as the
+		// preview (ear) button, whose state the controller may have changed.
+		audio_controls_.update();
 	}
 }
 

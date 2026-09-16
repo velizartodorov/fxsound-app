@@ -210,6 +210,18 @@
     <ClInclude Include="ptutil\include\filt.h">
       <Filter>Header Files\ptutil</Filter>
     </ClInclude>
+    <ClInclude Include="ptutil\include\FiltBrickwall.h">
+      <Filter>Header Files\ptutil</Filter>
+    </ClInclude>
+    <ClInclude Include="ptutil\pffft\pffft.h">
+      <Filter>Header Files\ptutil</Filter>
+    </ClInclude>
+    <ClInclude Include="ptutil\include\FiltBrickwallFir.h">
+      <Filter>Header Files\ptutil</Filter>
+    </ClInclude>
+    <ClInclude Include="ptutil\include\FiltPartConv.h">
+      <Filter>Header Files\ptutil</Filter>
+    </ClInclude>
     <ClInclude Include="ptutil\include\GraphicEq.h">
       <Filter>Header Files\ptutil</Filter>
     </ClInclude>
@@ -345,6 +357,18 @@
       <Filter>Source Files\ptutil\Qnt</Filter>
     </ClCompile>
     <ClCompile Include="ptutil\Filt\Fil12But.cpp">
+      <Filter>Source Files\ptutil\Filt</Filter>
+    </ClCompile>
+    <ClCompile Include="ptutil\Filt\FiltBrickwall.cpp">
+      <Filter>Source Files\ptutil\Filt</Filter>
+    </ClCompile>
+    <ClCompile Include="ptutil\pffft\pffft.c">
+      <Filter>Source Files\ptutil\Filt</Filter>
+    </ClCompile>
+    <ClCompile Include="ptutil\Filt\FiltBrickwallFir.cpp">
+      <Filter>Source Files\ptutil\Filt</Filter>
+    </ClCompile>
+    <ClCompile Include="ptutil\Filt\FiltPartConv.cpp">
       <Filter>Source Files\ptutil\Filt</Filter>
     </ClCompile>
     <ClCompile Include="ptutil\Filt\FiltbiqdSos.cpp">

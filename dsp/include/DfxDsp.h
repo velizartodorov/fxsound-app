@@ -36,6 +36,8 @@ class DfxDsp
 {
 public:
 	enum Effect { Fidelity = 0, Ambience = 1, Surround = 2, DynamicBoost = 3, Bass = 4, NumEffects = 5 };
+	enum BrickwallSteepness { Gentle = 0, Standard = 1, Steep = 2, UltraSteep = 3 };
+	enum BrickwallLinearPhaseLatency { Low = 0, Medium = 1, High = 2, Max = 3 };
 
 	DfxDsp();
 	~DfxDsp();
@@ -47,6 +49,19 @@ public:
 	int exportPreset(std::wstring preset_source_file_full_path, std::wstring preset_name, std::wstring preset_export_path);
 	void eqOn(bool on);
 	int getNumEqBands();
+	void brickwallFilterOn(bool on);
+	bool isBrickwallFilterOn();
+	void setBrickwallFilterSteepness(BrickwallSteepness steepness);
+	BrickwallSteepness getBrickwallFilterSteepness();
+	void brickwallFilterPreviewOn(bool on);
+	bool isBrickwallFilterPreviewOn();
+	void brickwallFilterLinearPhaseOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	double getBrickwallFilterLatencyMs();
+	void setBrickwallFilterLinearPhaseLatency(BrickwallLinearPhaseLatency latency);
+	BrickwallLinearPhaseLatency getBrickwallFilterLinearPhaseLatency();
+	void setBrickwallFilterHighPassCutoff(float cutoff_hz);
+	float getBrickwallFilterHighPassCutoff();
 	float getBalance();
 	void setBalance(float gain_db);
 	float getNormalization();

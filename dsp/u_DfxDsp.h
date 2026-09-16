@@ -20,11 +20,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 #include <string>
+#include <atomic>
+#include <thread>
 #include "AudioPassthru.h"
 #include "codedefs.h"
 #include "DfxDsp.h"
 #include "pt_defs.h"
 #include "slout.h"
+#include "FiltBrickwall.h"
+#include "FiltBrickwallFir.h"
+#include "FiltPartConv.h"
 
 struct dfxg_section_type {
 	realtype value;
@@ -88,6 +93,19 @@ public:
 	int resetEQ();
 	void eqOn(bool on);
 	int getNumEqBands();
+	void brickwallFilterOn(bool on);
+	bool isBrickwallFilterOn();
+	void setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness);
+	DfxDsp::BrickwallSteepness getBrickwallFilterSteepness();
+	void brickwallFilterPreviewOn(bool on);
+	bool isBrickwallFilterPreviewOn();
+	void brickwallFilterLinearPhaseOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	double getBrickwallFilterLatencyMs();
+	void setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinearPhaseLatency latency);
+	DfxDsp::BrickwallLinearPhaseLatency getBrickwallFilterLinearPhaseLatency();
+	void setBrickwallFilterHighPassCutoff(float cutoff_hz);
+	float getBrickwallFilterHighPassCutoff();
 	float getBalance();
 	void setBalance(float gain_db);
 	float getNormalization();
@@ -132,6 +150,17 @@ private:
 	int eqSetProcessingOn(int i_storage_type, int i_on);
 	int eqGetProcessingOn(int i_storage_type, int *ip_on);
 
+	// Brickwall filter (dsp/ptutil/include/FiltBrickwall.h)
+	void updateBrickwallFilterCoefficients();
+	void resetBrickwallFilterState();
+	void applyBrickwallFilter(float *audio_buffer, int num_sample_sets);
+
+	// Brickwall filter, linear-phase mode: FFT partitioned convolution
+	// (dsp/ptutil/include/FiltPartConv.h), designed on a background thread.
+	void requestBrickwallFirDesign();
+	void brickwallDesignerThreadMain();
+	void adoptPendingBrickwallFirEngine();
+
 	// Handles
 	int *dfxp_handle_;
 	int *preset_list_handle_;
@@ -155,5 +184,52 @@ private:
 	struct dfxg_product_specific_info_type product_specific_;
 
 	int eq_processing_on_;
+
+	// Written by the UI thread, read by the audio thread (the reset-serial
+	// ordering in brickwallFilterOn() relies on these being atomic).
+	std::atomic<bool> brickwall_filter_on_{ false };
+	std::atomic<bool> brickwall_filter_preview_on_{ false };
+	// FxSound's power state as seen by the low cut filter: powerOn(false)
+	// bypasses it along with the effects.
+	std::atomic<bool> brickwall_power_on_{ true };
+	// Preview auto-leveller state (audio thread only; see
+	// brickwallLevelPreviewFrame() in DfxDspPrivate.cpp).
+	float brickwall_preview_mean_square_ = 0.0f;
+	float brickwall_preview_gain_ = 1.0f;
+	bool brickwall_preview_was_on_ = false;
+	DfxDsp::BrickwallSteepness brickwall_filter_steepness_ = DfxDsp::BrickwallSteepness::Standard;
+	std::atomic<float> brickwall_hp_cutoff_hz_{ 20.0f }; // 0 = high-pass band bypassed; read by the designer thread
+	int brickwall_num_hp_sections_ = 0;
+	int brickwall_num_lp_sections_ = 0;
+	int brickwall_cached_sample_rate_ = 44100;
+	int brickwall_cached_num_channels_ = 2;
+	FiltBrickwallBiquadCoeffs brickwall_hp_coeffs_;
+	FiltBrickwallBiquadCoeffs brickwall_lp_coeffs_ = {}; // complementary low-pass for the preview only (the filter is a low cut)
+	FiltBrickwallChannelState brickwall_channel_states_[FILT_BRICKWALL_MAX_CHANNELS];
+
+	// Linear-phase engine hand-off. The UI and audio threads only store and
+	// exchange these atomics; brickwall_designer_thread_ does all design and
+	// allocation. pending: designer -> audio. retired: audio -> designer
+	// (holds at most one engine; the audio thread adopts only when it is
+	// empty, so nothing is leaked).
+	std::atomic<bool> brickwall_linear_phase_on_{ false };
+	std::atomic<int> brickwall_fir_latency_mode_{ DfxDsp::BrickwallLinearPhaseLatency::Low };
+	std::atomic<int> brickwall_fir_request_sample_rate_{ 44100 };
+	std::atomic<int> brickwall_fir_request_num_channels_{ 2 };
+	std::atomic<unsigned int> brickwall_fir_request_generation_{ 1 };
+	// Fresh-history serial. Bumped by the UI thread whenever filtering resumes
+	// (filter or linear phase turned on), since engines aren't fed while it is
+	// off. The designer stamps each new engine (FiltPartConv::serial) with the
+	// value it read before creating it; an engine whose serial differs from
+	// the current value always needs replacing, and the audio thread only
+	// processes an engine whose serial matches, passing audio through
+	// otherwise. So no history from before the latest resume is ever played.
+	std::atomic<unsigned int> brickwall_fir_reset_serial_{ 0 };
+	std::atomic<FiltPartConv*> brickwall_fir_pending_engine_{ nullptr };
+	std::atomic<FiltPartConv*> brickwall_fir_retired_engine_{ nullptr };
+	FiltPartConv *brickwall_fir_active_engine_ = nullptr; // audio thread only
+	std::atomic<double> brickwall_fir_active_latency_ms_{ 0.0 };
+	std::atomic<bool> brickwall_designer_stop_{ false };
+	std::thread brickwall_designer_thread_;
 };
 

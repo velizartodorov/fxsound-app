@@ -50,6 +50,7 @@ public:
 	static constexpr float DEFAULT_BALANCE = 0.0f;
 	static constexpr float DEFAULT_FILTER_Q = 1.0f;
 	static constexpr float DEFAULT_MASTER_GAIN = 0.0f;
+	static constexpr int DEFAULT_BRICKWALL_HP_CUTOFF_HZ = 20;
 	static constexpr float MIN_GAIN = -12.0f;
 	static constexpr float MAX_GAIN = 12.0f;
 	static constexpr char HK_CMD_ON_OFF[] = "cmd_on_off";
@@ -150,6 +151,20 @@ public:
 	bool isAlwaysOnTop();
 	void setAlwaysOnTop(bool always_on_top);
 
+	bool isBrickwallFilterOn();
+	void setBrickwallFilterOn(bool on);
+	DfxDsp::BrickwallSteepness getBrickwallFilterSteepness();
+	void setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness);
+	bool isBrickwallFilterPreviewOn();
+	void setBrickwallFilterPreviewOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	void setBrickwallFilterLinearPhaseOn(bool on);
+	DfxDsp::BrickwallLinearPhaseLatency getBrickwallFilterLinearPhaseLatency();
+	void setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinearPhaseLatency latency);
+	double getBrickwallFilterLatencyMs();
+	int getBrickwallFilterHighPassCutoff();
+	void setBrickwallFilterHighPassCutoff(int cutoff_hz);
+
 	bool isLaunchOnStartup();
 	void setLaunchOnStartup(bool launch_on_startup);
 
@@ -241,6 +256,7 @@ private:
 	void sortByDeviceConfigPriority(std::vector<SoundDevice>& devices);
 
 	void powerOn(bool on);
+	void stopBrickwallFilterPreview();
 
 	String getAutoSavePath() const;
     String getAutoSavePresetPath(const String& preset_name) const;

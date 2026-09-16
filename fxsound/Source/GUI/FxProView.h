@@ -48,6 +48,9 @@ private:
 	static constexpr int LIST_Y = 32;
 	static constexpr int AUDIO_X = 40;
 	static constexpr int AUDIO_Y = 88;
+	// The graphic EQ fills the space between the audio-controls box and this
+	// right edge, so widening the box narrows the EQ instead of the window.
+	static constexpr int EQUALIZER_RIGHT = 1000;
 	static constexpr int LIST_WIDTH = 470;
 	static constexpr int LIST_HEIGHT = 40;
 

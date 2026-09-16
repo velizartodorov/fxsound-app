@@ -759,6 +759,12 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 			path.createDirectory();
 		}
 
+		setBrickwallFilterSteepness(static_cast<DfxDsp::BrickwallSteepness>(settings_.getInt("brickwall_filter_steepness", static_cast<int>(DfxDsp::BrickwallSteepness::Standard))));
+		setBrickwallFilterLinearPhaseLatency(static_cast<DfxDsp::BrickwallLinearPhaseLatency>(settings_.getInt("brickwall_filter_linear_phase_latency", static_cast<int>(DfxDsp::BrickwallLinearPhaseLatency::Low))));
+		setBrickwallFilterLinearPhaseOn(settings_.getBool("brickwall_filter_linear_phase_on"));
+		setBrickwallFilterHighPassCutoff(settings_.getInt("brickwall_filter_hp_cutoff_hz", DEFAULT_BRICKWALL_HP_CUTOFF_HZ));
+		setBrickwallFilterOn(settings_.getBool("brickwall_filter_on"));
+
 		setPowerState(settings_.getBool("power"));
 
 		initPresets();
@@ -905,6 +911,11 @@ void FxController::showView()
 
 void FxController::switchView()
 {
+	// The Bandwidth Filter page (and its preview button) only exists in the
+	// Pro view; JUCE doesn't call its visibilityChanged() when the window's
+	// content is swapped, so stop the preview here.
+	stopBrickwallFilterPreview();
+
 	if (view_ == ViewType::Pro)
 	{
 		view_ = ViewType::Lite;
@@ -926,6 +937,11 @@ ViewType FxController::getCurrentView()
 
 void FxController::hideMainWindow()
 {
+	// Closing to the tray hides the window, not the Bandwidth Filter page
+	// itself, so its visibilityChanged() doesn't fire: stop the preview here
+	// rather than keep playing it with no visible control.
+	stopBrickwallFilterPreview();
+
 	if (main_window_->isOnDesktop())
 	{
 		main_window_->removeFromDesktop();
@@ -1785,6 +1801,7 @@ void FxController::powerOn(bool on)
 	else
 	{
 		dfx_dsp_.powerOn(false);
+		stopBrickwallFilterPreview();
 
 		if (isTimerRunning())
 		{
@@ -2624,6 +2641,96 @@ void FxController::setAlwaysOnTop(bool always_on_top)
 	always_on_top_ = always_on_top;
 	settings_.setBool("always_on_top", always_on_top);
 	main_window_->setAlwaysOnTop(always_on_top);
+}
+
+bool FxController::isBrickwallFilterOn()
+{
+	return dfx_dsp_.isBrickwallFilterOn();
+}
+
+void FxController::setBrickwallFilterOn(bool on)
+{
+	dfx_dsp_.brickwallFilterOn(on);
+	settings_.setBool("brickwall_filter_on", on);
+
+	if (!on)
+	{
+		stopBrickwallFilterPreview();
+	}
+}
+
+DfxDsp::BrickwallSteepness FxController::getBrickwallFilterSteepness()
+{
+	return dfx_dsp_.getBrickwallFilterSteepness();
+}
+
+void FxController::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
+{
+	dfx_dsp_.setBrickwallFilterSteepness(steepness);
+	settings_.setInt("brickwall_filter_steepness", static_cast<int>(steepness));
+}
+
+bool FxController::isBrickwallFilterPreviewOn()
+{
+	return dfx_dsp_.isBrickwallFilterPreviewOn();
+}
+
+void FxController::setBrickwallFilterPreviewOn(bool on)
+{
+	dfx_dsp_.brickwallFilterPreviewOn(on);
+}
+
+// Turns off the "what's removed" preview from outside the Bandwidth Filter
+// page (power off, filter off, window hidden, view switched). If it was on,
+// listeners are notified so the page's ear button follows the DSP state
+// (FxProView refreshes its audio controls on FxModel::Event::Other).
+void FxController::stopBrickwallFilterPreview()
+{
+	bool was_on = dfx_dsp_.isBrickwallFilterPreviewOn();
+
+	dfx_dsp_.brickwallFilterPreviewOn(false);
+	if (was_on)
+	{
+		FxModel::getModel().notifyListeners();
+	}
+}
+
+bool FxController::isBrickwallFilterLinearPhaseOn()
+{
+	return dfx_dsp_.isBrickwallFilterLinearPhaseOn();
+}
+
+void FxController::setBrickwallFilterLinearPhaseOn(bool on)
+{
+	dfx_dsp_.brickwallFilterLinearPhaseOn(on);
+	settings_.setBool("brickwall_filter_linear_phase_on", on);
+}
+
+DfxDsp::BrickwallLinearPhaseLatency FxController::getBrickwallFilterLinearPhaseLatency()
+{
+	return dfx_dsp_.getBrickwallFilterLinearPhaseLatency();
+}
+
+void FxController::setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinearPhaseLatency latency)
+{
+	dfx_dsp_.setBrickwallFilterLinearPhaseLatency(latency);
+	settings_.setInt("brickwall_filter_linear_phase_latency", static_cast<int>(dfx_dsp_.getBrickwallFilterLinearPhaseLatency()));
+}
+
+double FxController::getBrickwallFilterLatencyMs()
+{
+	return dfx_dsp_.getBrickwallFilterLatencyMs();
+}
+
+int FxController::getBrickwallFilterHighPassCutoff()
+{
+	return static_cast<int>(dfx_dsp_.getBrickwallFilterHighPassCutoff() + 0.5f);
+}
+
+void FxController::setBrickwallFilterHighPassCutoff(int cutoff_hz)
+{
+	dfx_dsp_.setBrickwallFilterHighPassCutoff(static_cast<float>(cutoff_hz));
+	settings_.setInt("brickwall_filter_hp_cutoff_hz", getBrickwallFilterHighPassCutoff());
 }
 
 bool FxController::isLaunchOnStartup()
