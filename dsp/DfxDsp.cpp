@@ -77,6 +77,36 @@ int DfxDsp::getNumEqBands()
 	return data_->getNumEqBands();
 }
 
+void DfxDsp::brickwallFilterOn(bool on)
+{
+	data_->brickwallFilterOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterOn()
+{
+	return data_->isBrickwallFilterOn();
+}
+
+void DfxDsp::setBrickwallFilterSteepness(BrickwallSteepness steepness)
+{
+	data_->setBrickwallFilterSteepness(steepness);
+}
+
+DfxDsp::BrickwallSteepness DfxDsp::getBrickwallFilterSteepness()
+{
+	return data_->getBrickwallFilterSteepness();
+}
+
+void DfxDsp::brickwallFilterPreviewOn(bool on)
+{
+	data_->brickwallFilterPreviewOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterPreviewOn()
+{
+	return data_->isBrickwallFilterPreviewOn();
+}
+
 DfxPreset DfxDsp::getPresetInfo(std::wstring preset_file_full_path)
 {
 	return data_->getPresetInfo(preset_file_full_path);

@@ -25,6 +25,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "DfxDsp.h"
 #include "pt_defs.h"
 #include "slout.h"
+#include "FiltBrickwall.h"
 
 struct dfxg_section_type {
 	realtype value;
@@ -88,6 +89,12 @@ public:
 	int resetEQ();
 	void eqOn(bool on);
 	int getNumEqBands();
+	void brickwallFilterOn(bool on);
+	bool isBrickwallFilterOn();
+	void setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness);
+	DfxDsp::BrickwallSteepness getBrickwallFilterSteepness();
+	void brickwallFilterPreviewOn(bool on);
+	bool isBrickwallFilterPreviewOn();
 	float getBalance();
 	void setBalance(float gain_db);
 	float getNormalization();
@@ -131,6 +138,11 @@ private:
 	int eqSetProcessingOn(int i_storage_type, int i_on);
 	int eqGetProcessingOn(int i_storage_type, int *ip_on);
 
+	// Brickwall filter (dsp/ptutil/include/FiltBrickwall.h)
+	void updateBrickwallFilterCoefficients();
+	void resetBrickwallFilterState();
+	void applyBrickwallFilter(float *audio_buffer, int num_sample_sets);
+
 	// Handles
 	int *dfxp_handle_;
 	int *preset_list_handle_;
@@ -154,5 +166,14 @@ private:
 	struct dfxg_product_specific_info_type product_specific_;
 
 	int eq_processing_on_;
+
+	bool brickwall_filter_on_ = false;
+	bool brickwall_filter_preview_on_ = false;
+	DfxDsp::BrickwallSteepness brickwall_filter_steepness_ = DfxDsp::BrickwallSteepness::Standard;
+	int brickwall_cached_sample_rate_ = 44100;
+	int brickwall_cached_num_channels_ = 2;
+	FiltBrickwallBiquadCoeffs brickwall_hp_coeffs_;
+	FiltBrickwallBiquadCoeffs brickwall_lp_coeffs_;
+	FiltBrickwallChannelState brickwall_channel_states_[FILT_BRICKWALL_MAX_CHANNELS];
 };
 

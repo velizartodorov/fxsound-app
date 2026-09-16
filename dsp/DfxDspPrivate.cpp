@@ -26,6 +26,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "file.h"
 #include "qnt.h"
 #include <string>
+#include <math.h>
+#include <cassert>
 
 #include "BinauralSyn.h"
 #include "ptutil\dfxp\u_dfxp.h"
@@ -49,6 +51,76 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define MIDI_MIN_VALUE          0
 #define MIDI_MAX_VALUE          127
+
+#define DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ  20.0
+#define DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ   20000.0
+
+/*
+ * FUNCTION: brickwallNumSectionsForSteepness()
+ * DESCRIPTION:
+ *   Maps the app-level steepness preset to a cascaded section count. See the
+ *   design spec for why these are cascades of identical fixed-Q sections
+ *   rather than a true per-stage-Q higher-order Butterworth.
+ */
+static int brickwallNumSectionsForSteepness(DfxDsp::BrickwallSteepness steepness)
+{
+	switch (steepness)
+	{
+	case DfxDsp::BrickwallSteepness::Gentle:
+		return 1;
+	case DfxDsp::BrickwallSteepness::Steep:
+		return 8;
+	case DfxDsp::BrickwallSteepness::Standard:
+	default:
+		return 4;
+	}
+}
+
+/*
+ * FUNCTION: debugVerifyBrickwallFilterResponse()
+ * DESCRIPTION:
+ *   Debug-only runtime self-check of the brickwall filter's frequency response,
+ *   in place of a unit test (this codebase has no test framework under dsp/).
+ *   Asserts (fails loudly in Debug builds) that:
+ *     - the passband (1kHz) is essentially untouched by the filter,
+ *     - content an octave below the 20Hz cutoff is measurably attenuated,
+ *     - the response rolls off approaching Nyquist (rather than asserting an
+ *       exact dB value there, since the exact -3dB point can shift near
+ *       Nyquist at 44.1/48kHz - see the design spec's Nyquist-proximity note).
+ */
+static void debugVerifyBrickwallFilterResponse()
+{
+	const double sample_rates[] = { 44100.0, 48000.0, 96000.0 };
+	const DfxDsp::BrickwallSteepness steepness_values[] = {
+		DfxDsp::BrickwallSteepness::Gentle,
+		DfxDsp::BrickwallSteepness::Standard,
+		DfxDsp::BrickwallSteepness::Steep
+	};
+	size_t rate_index, steepness_index;
+
+	for (rate_index = 0; rate_index < sizeof(sample_rates) / sizeof(sample_rates[0]); rate_index++)
+	{
+		double sample_rate = sample_rates[rate_index];
+		FiltBrickwallBiquadCoeffs hp_coeffs;
+		FiltBrickwallBiquadCoeffs lp_coeffs;
+
+		filtBrickwallDesignHighPass((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, &hp_coeffs);
+		filtBrickwallDesignLowPass((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)sample_rate, &lp_coeffs);
+
+		for (steepness_index = 0; steepness_index < sizeof(steepness_values) / sizeof(steepness_values[0]); steepness_index++)
+		{
+			int num_sections = brickwallNumSectionsForSteepness(steepness_values[steepness_index]);
+
+			double passband_db = filtBrickwallCalcResponseDb((realtype)1000.0, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+			double sub_audible_db = filtBrickwallCalcResponseDb((realtype)10.0, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+			double near_nyquist_db = filtBrickwallCalcResponseDb((realtype)(sample_rate * 0.49), (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+
+			assert(passband_db > -0.5);
+			assert(sub_audible_db < -6.0);
+			assert(near_nyquist_db < passband_db);
+		}
+	}
+}
 
 DfxDspPrivate::DfxDspPrivate()
 {
@@ -110,6 +182,15 @@ DfxDspPrivate::DfxDspPrivate()
 		IS_FALSE) != OKAY)
 	{
 	}
+
+	brickwall_cached_sample_rate_ = 44100;
+	brickwall_cached_num_channels_ = 2;
+	updateBrickwallFilterCoefficients();
+	resetBrickwallFilterState();
+
+#ifdef _DEBUG
+	debugVerifyBrickwallFilterResponse();
+#endif
 
 	//return(OKAY);
 }
@@ -185,6 +266,8 @@ int DfxDspPrivate::processAudio(short int *si_input_samples, short int *si_outpu
 	if (dfxpUniversalModifySamples(dfxp_handle_, si_input_samples, si_output_samples, i_num_sample_sets, i_check_for_duplicate_buffers) != OKAY)
 		return(NOT_OKAY);
 
+	applyBrickwallFilter(reinterpret_cast<float*>(si_output_samples), i_num_sample_sets);
+
 	return OKAY;
 }
 
@@ -193,7 +276,125 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 	if (dfxpUniversalSetSignalFormat(dfxp_handle_, i_bps, i_nch, i_srate, i_valid_bits) != OKAY)
 		return(NOT_OKAY);
 
+	if (i_srate != brickwall_cached_sample_rate_ || i_nch != brickwall_cached_num_channels_)
+	{
+		brickwall_cached_sample_rate_ = i_srate;
+		brickwall_cached_num_channels_ = i_nch;
+		updateBrickwallFilterCoefficients();
+		resetBrickwallFilterState();
+	}
+
 	return OKAY;
+}
+
+void DfxDspPrivate::updateBrickwallFilterCoefficients()
+{
+	filtBrickwallDesignHighPass((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, &brickwall_hp_coeffs_);
+	filtBrickwallDesignLowPass((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, &brickwall_lp_coeffs_);
+}
+
+void DfxDspPrivate::resetBrickwallFilterState()
+{
+	int channel;
+
+	for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+	{
+		filtBrickwallResetChannelState(&brickwall_channel_states_[channel]);
+	}
+}
+
+void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_sets)
+{
+	int num_sections;
+	int sample_index;
+	int channel;
+
+	if (!brickwall_filter_on_)
+	{
+		return;
+	}
+
+	num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
+
+	// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
+	// 1/4/8, but filtBrickwallProcessSample() does not itself bounds-check
+	// i_num_sections against FILT_BRICKWALL_MAX_SECTIONS before indexing into
+	// fixed-size arrays (Task 1 library code is generic and doesn't know
+	// about steepness policy). Clamp here, in the real-time audio path, as a
+	// safety net beyond what the brief's code shows.
+	if (num_sections > FILT_BRICKWALL_MAX_SECTIONS)
+	{
+		num_sections = FILT_BRICKWALL_MAX_SECTIONS;
+	}
+	else if (num_sections < 0)
+	{
+		num_sections = 0;
+	}
+
+	for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
+	{
+		for (channel = 0; channel < brickwall_cached_num_channels_ && channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+		{
+			int buffer_index = sample_index * brickwall_cached_num_channels_ + channel;
+			realtype pre_filter_sample = (realtype)audio_buffer[buffer_index];
+
+			realtype filtered_sample = filtBrickwallProcessSample(
+				pre_filter_sample,
+				num_sections,
+				&brickwall_hp_coeffs_,
+				&brickwall_lp_coeffs_,
+				&brickwall_channel_states_[channel]);
+
+			if (brickwall_filter_preview_on_)
+			{
+				audio_buffer[buffer_index] = (float)(pre_filter_sample - filtered_sample);
+			}
+			else
+			{
+				audio_buffer[buffer_index] = (float)filtered_sample;
+			}
+		}
+	}
+}
+
+void DfxDspPrivate::brickwallFilterOn(bool on)
+{
+	brickwall_filter_on_ = on;
+	if (on)
+	{
+		updateBrickwallFilterCoefficients();
+		resetBrickwallFilterState();
+	}
+	else
+	{
+		brickwall_filter_preview_on_ = false;
+	}
+}
+
+bool DfxDspPrivate::isBrickwallFilterOn()
+{
+	return brickwall_filter_on_;
+}
+
+void DfxDspPrivate::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
+{
+	brickwall_filter_steepness_ = steepness;
+	resetBrickwallFilterState();
+}
+
+DfxDsp::BrickwallSteepness DfxDspPrivate::getBrickwallFilterSteepness()
+{
+	return brickwall_filter_steepness_;
+}
+
+void DfxDspPrivate::brickwallFilterPreviewOn(bool on)
+{
+	brickwall_filter_preview_on_ = on && brickwall_filter_on_;
+}
+
+bool DfxDspPrivate::isBrickwallFilterPreviewOn()
+{
+	return brickwall_filter_preview_on_;
 }
 
 
