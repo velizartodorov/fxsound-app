@@ -81,12 +81,18 @@ static int brickwallNumSectionsForSteepness(DfxDsp::BrickwallSteepness steepness
  * DESCRIPTION:
  *   Debug-only runtime self-check of the brickwall filter's frequency response,
  *   in place of a unit test (this codebase has no test framework under dsp/).
- *   Asserts (fails loudly in Debug builds) that:
- *     - the passband (1kHz) is essentially untouched by the filter,
- *     - content an octave below the 20Hz cutoff is measurably attenuated,
- *     - the response rolls off approaching Nyquist (rather than asserting an
- *       exact dB value there, since the exact -3dB point can shift near
- *       Nyquist at 44.1/48kHz - see the design spec's Nyquist-proximity note).
+ *   Asserts (fails loudly in Debug builds), for every (sample rate, steepness)
+ *   combination, that:
+ *     - the passband (1kHz) is essentially untouched by the filter;
+ *     - the cascade's actual response at the 20Hz and 20kHz target cutoffs is
+ *       within a small tolerance of the intended -3.0103dB, confirming
+ *       filtBrickwallCalibrateCascadeCutoff() (FiltBrickwall.cpp) is correctly
+ *       compensating for the cascade-shift effect. An earlier version of this
+ *       filter used uncalibrated, fixed per-section design frequencies; real-
+ *       world listening found that this let the low-pass cutoff collapse to as
+ *       low as ~9-13kHz for Standard/Steep at 44.1/48kHz - a very audible loss
+ *       of treble. This assertion is written precisely enough that it would
+ *       have caught that regression.
  */
 static void debugVerifyBrickwallFilterResponse()
 {
@@ -101,23 +107,37 @@ static void debugVerifyBrickwallFilterResponse()
 	for (rate_index = 0; rate_index < sizeof(sample_rates) / sizeof(sample_rates[0]); rate_index++)
 	{
 		double sample_rate = sample_rates[rate_index];
-		FiltBrickwallBiquadCoeffs hp_coeffs;
-		FiltBrickwallBiquadCoeffs lp_coeffs;
-
-		filtBrickwallDesignHighPass((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, &hp_coeffs);
-		filtBrickwallDesignLowPass((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)sample_rate, &lp_coeffs);
 
 		for (steepness_index = 0; steepness_index < sizeof(steepness_values) / sizeof(steepness_values[0]); steepness_index++)
 		{
 			int num_sections = brickwallNumSectionsForSteepness(steepness_values[steepness_index]);
 
-			double passband_db = filtBrickwallCalcResponseDb((realtype)1000.0, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
-			double sub_audible_db = filtBrickwallCalcResponseDb((realtype)10.0, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
-			double near_nyquist_db = filtBrickwallCalcResponseDb((realtype)(sample_rate * 0.49), (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+			double calibrated_hp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, 1);
+			double calibrated_lp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, 0);
 
-			assert(passband_db > -0.5);
-			assert(sub_audible_db < -6.0);
-			assert(near_nyquist_db < passband_db);
+			FiltBrickwallBiquadCoeffs hp_coeffs;
+			FiltBrickwallBiquadCoeffs lp_coeffs;
+			filtBrickwallDesignHighPass((realtype)calibrated_hp_cutoff, (realtype)sample_rate, &hp_coeffs);
+			filtBrickwallDesignLowPass((realtype)calibrated_lp_cutoff, (realtype)sample_rate, &lp_coeffs);
+
+			double passband_db = filtBrickwallCalcResponseDb((realtype)1000.0, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+			double response_at_hp_target_db = filtBrickwallCalcResponseDb((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+			double response_at_lp_target_db = filtBrickwallCalcResponseDb((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, &hp_coeffs, &lp_coeffs);
+
+			// The high-pass target (20Hz) tolerance is wider than the low-pass one:
+			// verified numerically (in double precision) that the calibration search
+			// itself is exact, but evaluating it through this module's realtype
+			// (32-bit float) coefficients and filtPolyCalcBiquadPowerResponse's
+			// float-precision trig math loses meaningful accuracy at such a low
+			// absolute frequency relative to these sample rates (observed up to
+			// ~0.9dB off in float32, worst case fs=96000/Steep) - inaudible at
+			// 10-20Hz, but a real float32 precision limit, not a calibration bug.
+			// The low-pass target (20kHz) - the actual user-reported regression -
+			// stays accurate to within thousandths of a dB even in float32, so its
+			// tolerance stays tight.
+			assert(passband_db > -0.1);
+			assert(fabs(response_at_hp_target_db - (-3.0103)) < 1.5);
+			assert(fabs(response_at_lp_target_db - (-3.0103)) < 0.2);
 		}
 	}
 }
@@ -289,8 +309,17 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 
 void DfxDspPrivate::updateBrickwallFilterCoefficients()
 {
-	filtBrickwallDesignHighPass((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, &brickwall_hp_coeffs_);
-	filtBrickwallDesignLowPass((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, &brickwall_lp_coeffs_);
+	// Coefficients depend on the current section count (cascading shifts the
+	// cascade's actual -3dB point away from a single section's own cutoff), so
+	// this must be recomputed whenever num_sections changes too, not just the
+	// sample rate - see setBrickwallFilterSteepness() below.
+	int num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
+
+	double calibrated_hp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, num_sections, 1);
+	double calibrated_lp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ, (realtype)brickwall_cached_sample_rate_, num_sections, 0);
+
+	filtBrickwallDesignHighPass((realtype)calibrated_hp_cutoff, (realtype)brickwall_cached_sample_rate_, &brickwall_hp_coeffs_);
+	filtBrickwallDesignLowPass((realtype)calibrated_lp_cutoff, (realtype)brickwall_cached_sample_rate_, &brickwall_lp_coeffs_);
 }
 
 void DfxDspPrivate::resetBrickwallFilterState()
@@ -379,6 +408,7 @@ bool DfxDspPrivate::isBrickwallFilterOn()
 void DfxDspPrivate::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
 {
 	brickwall_filter_steepness_ = steepness;
+	updateBrickwallFilterCoefficients();
 	resetBrickwallFilterState();
 }
 

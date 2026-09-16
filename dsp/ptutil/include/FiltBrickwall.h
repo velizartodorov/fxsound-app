@@ -24,8 +24,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define FILT_BRICKWALL_MAX_CHANNELS  8
 #define FILT_BRICKWALL_MAX_SECTIONS  8
 
-/* Coefficients for one 2nd-order Butterworth section, as produced by
- * filtDesign2ndButLowPass()/filtDesign2ndButHighPass() (see Fil12But.cpp). */
+/* Coefficients for one 2nd-order Butterworth section, produced by
+ * filtBrickwallDesignHighPass()/filtBrickwallDesignLowPass() below (a bilinear-
+ * transform "RBJ cookbook" design - see FiltBrickwall.cpp for why the codebase's
+ * existing filtDesign2ndButLowPass()/HighPass() in Fil12But.cpp are not used here:
+ * they are inaccurate close to Nyquist, which a 20kHz cutoff always is at 44.1/48kHz). */
 struct FiltBrickwallBiquadCoeffs {
 	realtype gain;
 	realtype a1;
@@ -56,5 +59,18 @@ realtype PT_DECLSPEC filtBrickwallProcessSample(realtype r_input, int i_num_sect
 	FiltBrickwallChannelState *sp_state);
 double PT_DECLSPEC filtBrickwallCalcResponseDb(realtype r_freq_hz, realtype r_sample_rate_hz, int i_num_sections,
 	const FiltBrickwallBiquadCoeffs *cp_hp_coeffs, const FiltBrickwallBiquadCoeffs *cp_lp_coeffs);
+
+/*
+ * Finds, by numeric search, the single-section design cutoff (passed to
+ * filtBrickwallDesignHighPass()/LowPass() below) such that a cascade of
+ * i_num_sections identical sections is exactly -3dB at r_target_cutoff_hz.
+ * Needed because cascading identical fixed-Q sections shifts the cascade's
+ * actual -3dB point away from the single-section design frequency; a closed-form
+ * correction was tried and found unreliable near Nyquist, so this searches
+ * numerically instead (see design spec for the history). i_high_pass_flag is
+ * nonzero for the high-pass band, zero for the low-pass band. Control-thread
+ * only - never call this from the real-time audio path.
+ */
+double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(realtype r_target_cutoff_hz, realtype r_sample_rate_hz, int i_num_sections, int i_high_pass_flag);
 
 #endif
