@@ -70,6 +70,19 @@ private:
 		std::unique_ptr<Drawable> image_;
 	};
 
+	class BrickwallPreviewButton : public Button
+	{
+	public:
+		BrickwallPreviewButton() : Button("HearWhatsRemoved")
+		{
+			setMouseCursor(MouseCursor::PointingHandCursor);
+			setClickingTogglesState(true);
+		}
+		~BrickwallPreviewButton() = default;
+
+		void paintButton(Graphics& g, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override;
+	};
+
 	class SettingsPane : public Component
 	{
 	public:    
@@ -107,11 +120,17 @@ private:
 		static constexpr int RESET_PRESETS_BUTTON_WIDTH = 220;
 		static constexpr int BUTTON_HEIGHT = 24;
 		static constexpr int MAX_BUTTON_WIDTH = 315;
-		static constexpr int BRICKWALL_STEEPNESS_RADIO_GROUP_ID = 1;
+		static constexpr int STEEPNESS_VALUE_LABEL_WIDTH = 260;
+		static constexpr int SLIDER_HEIGHT = 24;
+		static constexpr int PREVIEW_BUTTON_WIDTH = 28;
+		static constexpr int PREVIEW_BUTTON_GAP = 8;
+		static constexpr int POSITION_LABEL_WIDTH = 40;
+		static constexpr int POSITION_LABEL_GAP = 8;
 
 		void setText();
 		void resizeResetButton(int x, int y);
 		void updateBrickwallControlsEnabled();
+		void updateBrickwallSteepnessLabel();
 
 		void visibilityChanged() override;
 		void mouseEnter(const MouseEvent& mouse_event) override;
@@ -123,15 +142,15 @@ private:
 
 		Label brickwall_filter_title_;
 		ToggleButton brickwall_filter_toggle_;
-		ToggleButton brickwall_gentle_toggle_;
-		ToggleButton brickwall_standard_toggle_;
-		ToggleButton brickwall_steep_toggle_;
-		ToggleButton brickwall_ultra_steep_toggle_;
-		TextButton brickwall_preview_button_;
+		Slider brickwall_steepness_slider_;
+		Label brickwall_steepness_value_label_;
+		Label brickwall_steepness_position_label_;
+		BrickwallPreviewButton brickwall_preview_button_;
 
 		TextButton reset_presets_button_;
 
 		juce::Rectangle<float> output_preference_bounds_;
+		juce::Rectangle<float> brickwall_group_bounds_;
 	};
 
 	class GeneralSettingsPane : public SettingsPane
@@ -198,7 +217,7 @@ private:
 	{
 	public:
         static constexpr int WIDTH = 600;
-        static constexpr int HEIGHT = 695;
+        static constexpr int HEIGHT = 610;
 
 		SettingsComponent();
         ~SettingsComponent() = default;

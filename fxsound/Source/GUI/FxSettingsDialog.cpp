@@ -77,6 +77,71 @@ void FxSettingsDialog::SettingsButton::paint(Graphics& g)
 	g.drawText(TRANS(getName()), juce::Rectangle<int>(bounds.getHeight()+5, 0, w, bounds.getHeight()), Justification::centredLeft);
 }
 
+void FxSettingsDialog::BrickwallPreviewButton::paintButton(Graphics& g, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown)
+{
+	auto bounds = getLocalBounds().toFloat().reduced(2.0f);
+
+	// Active (previewing) matches the slider's own active/filled colour; grey
+	// otherwise, whether that's "off but clickable" or "disabled" (master
+	// filter off) - a 0.3-alpha grey on this dark theme's background reads as
+	// essentially invisible, so the disabled state only dims slightly, not
+	// enough to disappear. Colour(uint32) alone is fully transparent (the raw
+	// FXCOLOR value has no alpha byte set) - every branch below must call
+	// withAlpha() explicitly, matching this file's existing Colour(FXCOLOR(x))
+	// usages elsewhere (e.g. SettingsButton::paint()).
+	Colour colour;
+	if (getToggleState())
+	{
+		colour = Colour(FXCOLOR(SliderTrack)).withAlpha(1.0f);
+	}
+	else if (isEnabled())
+	{
+		colour = Colour(FXCOLOR(DefaultText)).withAlpha(1.0f);
+	}
+	else
+	{
+		colour = Colour(FXCOLOR(DefaultText)).withAlpha(0.5f);
+	}
+
+	if (isEnabled() && (shouldDrawButtonAsHighlighted || shouldDrawButtonAsDown))
+	{
+		colour = colour.brighter(0.3f);
+	}
+
+	// Headphones icon: a headband arc over two ear cups - the standard
+	// "monitor/preview audio" symbol in audio software (no bitmap/SVG asset -
+	// this codebase's images go through Projucer's BinaryData step, which
+	// isn't available in this environment). Built in a fixed 24x24 normalized
+	// box, then one shared transform fits the whole icon (headband + both
+	// cups) into the button's actual bounds, so the pieces stay proportioned
+	// to each other regardless of button size.
+	constexpr float ICON_BOX = 24.0f;
+
+	Path headband_path;
+	headband_path.addCentredArc(12.0f, 13.0f, 8.5f, 8.5f, 0.0f,
+		MathConstants<float>::pi * 1.5f, MathConstants<float>::pi * 2.5f, true);
+
+	Path left_cup_path;
+	left_cup_path.addRoundedRectangle(2.5f, 12.0f, 5.0f, 8.5f, 2.2f);
+
+	Path right_cup_path;
+	right_cup_path.addRoundedRectangle(16.5f, 12.0f, 5.0f, 8.5f, 2.2f);
+
+	auto scale = jmin(bounds.getWidth(), bounds.getHeight()) / ICON_BOX;
+	auto offset_x = bounds.getX() + (bounds.getWidth() - ICON_BOX * scale) * 0.5f;
+	auto offset_y = bounds.getY() + (bounds.getHeight() - ICON_BOX * scale) * 0.5f;
+	auto transform = AffineTransform::scale(scale).translated(offset_x, offset_y);
+
+	headband_path.applyTransform(transform);
+	left_cup_path.applyTransform(transform);
+	right_cup_path.applyTransform(transform);
+
+	g.setColour(colour);
+	g.strokePath(headband_path, PathStrokeType(ICON_BOX * scale * 0.09f, PathStrokeType::curved, PathStrokeType::rounded));
+	g.fillPath(left_cup_path);
+	g.fillPath(right_cup_path);
+}
+
 bool FxSettingsDialog::keyPressed(const KeyPress& key)
 {
 	if (key == KeyPress::escapeKey)
@@ -184,15 +249,72 @@ void FxSettingsDialog::SettingsPane::paint(Graphics&)
     title_.setText(TRANS(name_), NotificationType::dontSendNotification);    
 }
 
+namespace
+{
+	// Slider positions 0-3 map directly to DfxDsp::BrickwallSteepness (also
+	// 0-3). Position 4 is a UI-only concept - linear-phase (FIR) mode - which
+	// is a separate bool on the controller/DSP layer, not a BrickwallSteepness
+	// value; see updateBrickwallSteepnessLabel() and the slider's onValueChange
+	// for how position 4 is translated. Computed fresh on every call (not
+	// cached) so the text refreshes correctly if the display language changes,
+	// matching this file's existing TRANS()-at-point-of-use convention (see
+	// setText()).
+	constexpr int BRICKWALL_LINEAR_PHASE_SLIDER_POSITION = 4;
+
+	String brickwallSteepnessLabel(int position)
+	{
+		switch (position)
+		{
+		case DfxDsp::BrickwallSteepness::Gentle:
+			return TRANS("Gentle (~12 dB/octave)");
+		case DfxDsp::BrickwallSteepness::Standard:
+			return TRANS("Standard (~48 dB/octave)");
+		case DfxDsp::BrickwallSteepness::Steep:
+			return TRANS("Steep (~96 dB/octave)");
+		case DfxDsp::BrickwallSteepness::UltraSteep:
+			return TRANS("Ultra Steep (~132 dB/octave)");
+		case BRICKWALL_LINEAR_PHASE_SLIDER_POSITION:
+		default:
+			return TRANS("Linear Phase (~20ms added latency)");
+		}
+	}
+
+	String brickwallSteepnessTooltip(int position)
+	{
+		switch (position)
+		{
+		case DfxDsp::BrickwallSteepness::Gentle:
+			return TRANS("Gentlest rolloff. Lowest CPU use, but lets more content below 20Hz and above 20kHz through.");
+		case DfxDsp::BrickwallSteepness::Standard:
+			return TRANS("Balanced rolloff and CPU use. Recommended for most listening.");
+		case DfxDsp::BrickwallSteepness::Steep:
+			return TRANS("Steep rolloff, at the cost of more CPU use and more phase distortion right at the edges of the band.");
+		case DfxDsp::BrickwallSteepness::UltraSteep:
+			return TRANS("Steepest rolloff and closest to a true brickwall, at the cost of the most CPU use and the most phase distortion right at the edges of the band.");
+		case BRICKWALL_LINEAR_PHASE_SLIDER_POSITION:
+		default:
+			return TRANS("Zero phase distortion, at the cost of noticeable added latency to all audio while enabled - may cause video/game audio to drift out of sync.");
+		}
+	}
+
+	// The slider is the single UI control for two independent controller-side
+	// concepts (steepness enum, linear-phase bool) - this combines them into
+	// the one slider position that should be displayed.
+	int currentBrickwallSliderPosition(FxController& controller)
+	{
+		if (controller.isBrickwallFilterLinearPhaseOn())
+		{
+			return BRICKWALL_LINEAR_PHASE_SLIDER_POSITION;
+		}
+
+		return static_cast<int>(controller.getBrickwallFilterSteepness());
+	}
+}
+
 FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	SettingsPane("Audio"),
 	prioritize_new_output_toggle_(TRANS("Prioritize new output devices")),
 	brickwall_filter_toggle_(TRANS("Brickwall Filter (20Hz - 20kHz)")),
-	brickwall_gentle_toggle_(TRANS("Gentle (~12 dB/octave)")),
-	brickwall_standard_toggle_(TRANS("Standard (~48 dB/octave)")),
-	brickwall_steep_toggle_(TRANS("Steep (~96 dB/octave)")),
-	brickwall_ultra_steep_toggle_(TRANS("Ultra Steep (~132 dB/octave)")),
-	brickwall_preview_button_(TRANS("Hear What's Removed")),
 	reset_presets_button_(TRANS("Reset presets to factory defaults"))
 {
 	setFocusContainer(true);
@@ -228,39 +350,38 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 		updateBrickwallControlsEnabled();
 		};
 
-	brickwall_gentle_toggle_.setTooltip(TRANS("Gentlest rolloff. Lowest CPU use, but lets more content below 20Hz and above 20kHz through."));
-	brickwall_standard_toggle_.setTooltip(TRANS("Balanced rolloff and CPU use. Recommended for most listening."));
-	brickwall_steep_toggle_.setTooltip(TRANS("Steep rolloff, at the cost of more CPU use and more phase distortion right at the edges of the band."));
-	brickwall_ultra_steep_toggle_.setTooltip(TRANS("Steepest rolloff and closest to a true brickwall, at the cost of the most CPU use and the most phase distortion right at the edges of the band."));
+	brickwall_steepness_slider_.setSliderStyle(Slider::LinearHorizontal);
+	brickwall_steepness_slider_.setRange(0, 4, 1);
+	brickwall_steepness_slider_.setTextBoxStyle(Slider::NoTextBox, false, 0, 0);
+	brickwall_steepness_slider_.setMouseCursor(MouseCursor::PointingHandCursor);
+	brickwall_steepness_slider_.setWantsKeyboardFocus(true);
+	brickwall_steepness_slider_.setValue(static_cast<double>(currentBrickwallSliderPosition(FxController::getInstance())), NotificationType::dontSendNotification);
+	brickwall_steepness_slider_.onValueChange = [this]() {
+		auto& controller = FxController::getInstance();
+		int position = static_cast<int>(brickwall_steepness_slider_.getValue());
 
-	for (auto* steepness_toggle : { &brickwall_gentle_toggle_, &brickwall_standard_toggle_, &brickwall_steep_toggle_, &brickwall_ultra_steep_toggle_ })
-	{
-		steepness_toggle->setMouseCursor(MouseCursor::PointingHandCursor);
-		steepness_toggle->setColour(ToggleButton::ColourIds::tickColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
-		steepness_toggle->setColour(ToggleButton::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
-		steepness_toggle->setWantsKeyboardFocus(true);
-		steepness_toggle->setRadioGroupId(BRICKWALL_STEEPNESS_RADIO_GROUP_ID);
-	}
+		if (position == BRICKWALL_LINEAR_PHASE_SLIDER_POSITION)
+		{
+			controller.setBrickwallFilterLinearPhaseOn(true);
+		}
+		else
+		{
+			controller.setBrickwallFilterLinearPhaseOn(false);
+			controller.setBrickwallFilterSteepness(static_cast<DfxDsp::BrickwallSteepness>(position));
+		}
 
-	auto current_steepness = FxController::getInstance().getBrickwallFilterSteepness();
-	brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
-	brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
-	brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
-	brickwall_ultra_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::UltraSteep, NotificationType::dontSendNotification);
+		updateBrickwallSteepnessLabel();
+		};
 
-	brickwall_gentle_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Gentle); };
-	brickwall_standard_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Standard); };
-	brickwall_steep_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Steep); };
-	brickwall_ultra_steep_toggle_.onClick = [this]() { FxController::getInstance().setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::UltraSteep); };
+	brickwall_steepness_value_label_.setJustificationType(Justification::centredLeft);
+	brickwall_steepness_position_label_.setJustificationType(Justification::centredLeft);
+	brickwall_steepness_position_label_.setColour(Label::ColourIds::textColourId, getLookAndFeel().findColour(TextButton::textColourOnId));
+	updateBrickwallSteepnessLabel();
 
-	brickwall_preview_button_.setClickingTogglesState(true);
-	brickwall_preview_button_.setMouseCursor(MouseCursor::PointingHandCursor);
 	brickwall_preview_button_.setTooltip(TRANS("Plays back only the content the filter is removing, so you can hear what it affects."));
 	brickwall_preview_button_.onClick = [this]() {
 		auto& controller = FxController::getInstance();
-		bool preview_on = brickwall_preview_button_.getToggleState();
-		controller.setBrickwallFilterPreviewOn(preview_on);
-		brickwall_preview_button_.setButtonText(preview_on ? TRANS("Stop Previewing") : TRANS("Hear What's Removed"));
+		controller.setBrickwallFilterPreviewOn(brickwall_preview_button_.getToggleState());
 		};
 
 	updateBrickwallControlsEnabled();
@@ -291,10 +412,9 @@ FxSettingsDialog::AudioSettingsPane::AudioSettingsPane() :
 	addAndMakeVisible(&prioritize_new_output_toggle_);
 	addAndMakeVisible(&brickwall_filter_title_);
 	addAndMakeVisible(&brickwall_filter_toggle_);
-	addAndMakeVisible(&brickwall_gentle_toggle_);
-	addAndMakeVisible(&brickwall_standard_toggle_);
-	addAndMakeVisible(&brickwall_steep_toggle_);
-	addAndMakeVisible(&brickwall_ultra_steep_toggle_);
+	addAndMakeVisible(&brickwall_steepness_slider_);
+	addAndMakeVisible(&brickwall_steepness_value_label_);
+	addAndMakeVisible(&brickwall_steepness_position_label_);
 	addAndMakeVisible(&brickwall_preview_button_);
 	addAndMakeVisible(&reset_presets_button_);
 }
@@ -303,17 +423,29 @@ void FxSettingsDialog::AudioSettingsPane::updateBrickwallControlsEnabled()
 {
 	bool filter_on = brickwall_filter_toggle_.getToggleState();
 
-	brickwall_gentle_toggle_.setEnabled(filter_on);
-	brickwall_standard_toggle_.setEnabled(filter_on);
-	brickwall_steep_toggle_.setEnabled(filter_on);
-	brickwall_ultra_steep_toggle_.setEnabled(filter_on);
+	brickwall_steepness_slider_.setEnabled(filter_on);
 	brickwall_preview_button_.setEnabled(filter_on);
 
 	if (!filter_on && brickwall_preview_button_.getToggleState())
 	{
 		brickwall_preview_button_.setToggleState(false, NotificationType::dontSendNotification);
-		brickwall_preview_button_.setButtonText(TRANS("Hear What's Removed"));
 	}
+}
+
+void FxSettingsDialog::AudioSettingsPane::updateBrickwallSteepnessLabel()
+{
+	int position = static_cast<int>(brickwall_steepness_slider_.getValue());
+
+	brickwall_steepness_value_label_.setText(brickwallSteepnessLabel(position), NotificationType::dontSendNotification);
+	brickwall_steepness_slider_.setTooltip(brickwallSteepnessTooltip(position));
+
+	static constexpr int BRICKWALL_SLIDER_NUM_POSITIONS = BRICKWALL_LINEAR_PHASE_SLIDER_POSITION + 1;
+	brickwall_steepness_position_label_.setText(String(position + 1) + "/" + String(BRICKWALL_SLIDER_NUM_POSITIONS), NotificationType::dontSendNotification);
+
+	auto pos = brickwall_steepness_slider_.getPositionOfValue(brickwall_steepness_slider_.getValue());
+	auto slider_bounds = brickwall_steepness_slider_.getBounds();
+	auto x = jmin(slider_bounds.getX() + (int)pos + FxTheme::SLIDER_THUMB_RADIUS, slider_bounds.getRight() - STEEPNESS_VALUE_LABEL_WIDTH);
+	brickwall_steepness_value_label_.setBounds(x, slider_bounds.getBottom() + 2, STEEPNESS_VALUE_LABEL_WIDTH, LABEL_HEIGHT);
 }
 
 FxSettingsDialog::AudioSettingsPane::~AudioSettingsPane()
@@ -345,24 +477,26 @@ void FxSettingsDialog::AudioSettingsPane::resized()
 	y = brickwall_filter_title_.getBottom() + 10;
 	brickwall_filter_toggle_.setBounds(X_MARGIN, y, width, TOGGLE_BUTTON_HEIGHT);
 
-	y = brickwall_filter_toggle_.getBottom() + 5;
+	y = brickwall_filter_toggle_.getBottom() + 10;
 	auto steepness_indent = X_MARGIN + 20;
 	auto steepness_width = width - 20;
-	brickwall_gentle_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+	brickwall_preview_button_.setBounds(steepness_indent, y, PREVIEW_BUTTON_WIDTH, SLIDER_HEIGHT);
 
-	y = brickwall_gentle_toggle_.getBottom() + 5;
-	brickwall_standard_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+	auto slider_x = steepness_indent + PREVIEW_BUTTON_WIDTH + PREVIEW_BUTTON_GAP;
+	auto slider_width = steepness_width - PREVIEW_BUTTON_WIDTH - PREVIEW_BUTTON_GAP - POSITION_LABEL_WIDTH - POSITION_LABEL_GAP;
+	brickwall_steepness_slider_.setBounds(slider_x, y, slider_width, SLIDER_HEIGHT);
 
-	y = brickwall_standard_toggle_.getBottom() + 5;
-	brickwall_steep_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+	brickwall_steepness_position_label_.setBounds(brickwall_steepness_slider_.getRight() + POSITION_LABEL_GAP, y, POSITION_LABEL_WIDTH, SLIDER_HEIGHT);
 
-	y = brickwall_steep_toggle_.getBottom() + 5;
-	brickwall_ultra_steep_toggle_.setBounds(steepness_indent, y, steepness_width, TOGGLE_BUTTON_HEIGHT);
+	updateBrickwallSteepnessLabel();
 
-	y = brickwall_ultra_steep_toggle_.getBottom() + 10;
-	brickwall_preview_button_.setBounds(steepness_indent, y, RESET_PRESETS_BUTTON_WIDTH, BUTTON_HEIGHT);
+	auto brickwall_group_x = brickwall_filter_title_.getX() - GROUP_MARGIN;
+	auto brickwall_group_y = brickwall_filter_title_.getY() - GROUP_MARGIN;
+	auto brickwall_group_width = width + GROUP_MARGIN * 2;
+	auto brickwall_group_height = brickwall_steepness_value_label_.getBottom() - brickwall_group_y + GROUP_MARGIN;
+	brickwall_group_bounds_ = juce::Rectangle<float>(brickwall_group_x, brickwall_group_y, brickwall_group_width, brickwall_group_height);
 
-	y = brickwall_preview_button_.getBottom() + 30;
+	y = brickwall_steepness_value_label_.getBottom() + 30;
 	resizeResetButton(X_MARGIN, y);
 }
 
@@ -372,6 +506,7 @@ void FxSettingsDialog::AudioSettingsPane::paint(Graphics& g)
 
 	g.setFillType(FillType(Colour(FXCOLOR(DefaultFill)).withAlpha(0.2f)));
 	g.fillRoundedRectangle(output_preference_bounds_, 8);
+	g.fillRoundedRectangle(brickwall_group_bounds_, 8);
 
 	setText();
 
@@ -390,10 +525,7 @@ void FxSettingsDialog::AudioSettingsPane::setText()
 	brickwall_filter_title_.setFont(theme.getNormalFont());
 	brickwall_filter_title_.setText(TRANS("Bandwidth Filter"), NotificationType::dontSendNotification);
 	brickwall_filter_toggle_.setButtonText(TRANS("Brickwall Filter (20Hz - 20kHz)"));
-	brickwall_gentle_toggle_.setButtonText(TRANS("Gentle (~12 dB/octave)"));
-	brickwall_standard_toggle_.setButtonText(TRANS("Standard (~48 dB/octave)"));
-	brickwall_steep_toggle_.setButtonText(TRANS("Steep (~96 dB/octave)"));
-	brickwall_ultra_steep_toggle_.setButtonText(TRANS("Ultra Steep (~132 dB/octave)"));
+	updateBrickwallSteepnessLabel();
 
 	reset_presets_button_.setButtonText(TRANS("Reset presets to factory defaults"));
 	resizeResetButton(reset_presets_button_.getX(), reset_presets_button_.getY());
@@ -437,15 +569,10 @@ void FxSettingsDialog::AudioSettingsPane::visibilityChanged()
 
 		brickwall_filter_toggle_.setToggleState(controller.isBrickwallFilterOn(), NotificationType::dontSendNotification);
 
-		auto current_steepness = controller.getBrickwallFilterSteepness();
-		brickwall_gentle_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Gentle, NotificationType::dontSendNotification);
-		brickwall_standard_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Standard, NotificationType::dontSendNotification);
-		brickwall_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::Steep, NotificationType::dontSendNotification);
-		brickwall_ultra_steep_toggle_.setToggleState(current_steepness == DfxDsp::BrickwallSteepness::UltraSteep, NotificationType::dontSendNotification);
+		brickwall_steepness_slider_.setValue(static_cast<double>(currentBrickwallSliderPosition(controller)), NotificationType::dontSendNotification);
+		updateBrickwallSteepnessLabel();
 
-		bool preview_on = controller.isBrickwallFilterPreviewOn();
-		brickwall_preview_button_.setToggleState(preview_on, NotificationType::dontSendNotification);
-		brickwall_preview_button_.setButtonText(preview_on ? TRANS("Stop Previewing") : TRANS("Hear What's Removed"));
+		brickwall_preview_button_.setToggleState(controller.isBrickwallFilterPreviewOn(), NotificationType::dontSendNotification);
 
 		updateBrickwallControlsEnabled();
     }

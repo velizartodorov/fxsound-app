@@ -107,6 +107,21 @@ bool DfxDsp::isBrickwallFilterPreviewOn()
 	return data_->isBrickwallFilterPreviewOn();
 }
 
+void DfxDsp::brickwallFilterLinearPhaseOn(bool on)
+{
+	data_->brickwallFilterLinearPhaseOn(on);
+}
+
+bool DfxDsp::isBrickwallFilterLinearPhaseOn()
+{
+	return data_->isBrickwallFilterLinearPhaseOn();
+}
+
+double DfxDsp::getBrickwallFilterLatencyMs()
+{
+	return data_->getBrickwallFilterLatencyMs();
+}
+
 DfxPreset DfxDsp::getPresetInfo(std::wstring preset_file_full_path)
 {
 	return data_->getPresetInfo(preset_file_full_path);

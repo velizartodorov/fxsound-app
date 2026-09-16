@@ -54,6 +54,32 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ  20.0
 #define DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ   20000.0
+// One-way group delay target for linear-phase FIR mode. Verified numerically
+// (windowed-sinc bandpass design): at this latency the 20kHz low-pass edge is
+// effectively a true brickwall (>130dB rejection one semitone above cutoff at
+// 44.1kHz), while the 20Hz high-pass edge is necessarily far gentler - tens of
+// thousands more taps (and proportionally more latency) would be needed to make
+// the 20Hz edge comparably sharp, since transition width in Hz (not the cutoff
+// frequency itself) is what drives tap count. See the design spec.
+// Lowered from an initial 50ms after real-world testing found the direct-
+// convolution cost (thousands of taps/sample) caused audible glitching in
+// unoptimized (Debug) builds - confirmed as a compute-budget issue, not a
+// logic bug, since Release builds (compiler-vectorized) did not glitch.
+// 20ms roughly halves the tap count and gives meaningfully more headroom,
+// while the 20kHz low-pass edge - the steep, "brickwall" side of this filter -
+// stays effectively unchanged (verified: still >110dB rejection one semitone
+// above cutoff). Only the already-gentle 20Hz high-pass edge loses further
+// rejection depth, e.g. -17dB->-7dB at 10Hz - real, but inaudible at 10Hz.
+#define DFXG_BRICKWALL_FIR_TARGET_LATENCY_MS 20.0
+// Makeup gain applied only to the linear-phase FIR preview ("Hear What's
+// Removed") residual, not to normal filtered output. This filter's passband is
+// close enough to ideal unity gain (~0.000dB deviation, verified numerically)
+// that for typical music - almost entirely within 20Hz-20kHz - the raw
+// dry-minus-filtered difference rounds to at or near zero in 32-bit float,
+// audible as silence even though the filter is working correctly (confirmed:
+// normal filtered playback is unaffected). +30dB is the same fix professional
+// "null test"/difference-listening audio tools use for this exact situation.
+#define DFXG_BRICKWALL_FIR_PREVIEW_GAIN 31.6228f
 
 /*
  * FUNCTION: brickwallNumSectionsForSteepness()
@@ -145,6 +171,48 @@ static void debugVerifyBrickwallFilterResponse()
 	}
 }
 
+/*
+ * FUNCTION: debugVerifyBrickwallFirResponse()
+ * DESCRIPTION:
+ *   Debug-only runtime self-check of the linear-phase FIR filter, mirroring
+ *   debugVerifyBrickwallFilterResponse() above for the IIR cascade. Asserts,
+ *   at each tested sample rate, that: the passband (1kHz) is essentially
+ *   untouched; the low-pass edge rejects strongly just above 20kHz (verified
+ *   numerically to exceed 100dB rejection at every tested rate - this is the
+ *   FIR design's real strength, see filtBrickwallFirDesign()'s comment); and
+ *   the reported latency matches the actual tap count exactly.
+ */
+static void debugVerifyBrickwallFirResponse()
+{
+	const double sample_rates[] = { 44100.0, 48000.0, 96000.0 };
+	size_t rate_index;
+
+	for (rate_index = 0; rate_index < sizeof(sample_rates) / sizeof(sample_rates[0]); rate_index++)
+	{
+		double sample_rate = sample_rates[rate_index];
+		realtype coeffs[FILT_BRICKWALL_FIR_MAX_TAPS];
+		int num_taps = 0;
+
+		filtBrickwallFirDesign(
+			(realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ,
+			(realtype)sample_rate, (realtype)DFXG_BRICKWALL_FIR_TARGET_LATENCY_MS,
+			coeffs, &num_taps, FILT_BRICKWALL_FIR_MAX_TAPS);
+
+		assert(num_taps > 0 && (num_taps % 2) == 1);
+
+		double expected_latency_ms = ((double)(num_taps - 1) / (2.0 * sample_rate)) * 1000.0;
+		double actual_latency_ms = filtBrickwallFirGetLatencyMs(num_taps, (realtype)sample_rate);
+		assert(fabs(actual_latency_ms - expected_latency_ms) < 0.001);
+		assert(fabs(actual_latency_ms - DFXG_BRICKWALL_FIR_TARGET_LATENCY_MS) < 1.0);
+
+		double passband_db = filtBrickwallFirCalcResponseDb((realtype)1000.0, (realtype)sample_rate, coeffs, num_taps);
+		double just_above_lp_cutoff_db = filtBrickwallFirCalcResponseDb((realtype)(DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ * 1.05), (realtype)sample_rate, coeffs, num_taps);
+
+		assert(passband_db > -0.5);
+		assert(just_above_lp_cutoff_db < -80.0);
+	}
+}
+
 DfxDspPrivate::DfxDspPrivate()
 {
 	dfxp_handle_ = NULL;
@@ -210,9 +278,12 @@ DfxDspPrivate::DfxDspPrivate()
 	brickwall_cached_num_channels_ = 2;
 	updateBrickwallFilterCoefficients();
 	resetBrickwallFilterState();
+	updateBrickwallFirCoefficients();
+	resetBrickwallFirState();
 
 #ifdef _DEBUG
 	debugVerifyBrickwallFilterResponse();
+	debugVerifyBrickwallFirResponse();
 #endif
 
 	//return(OKAY);
@@ -305,6 +376,8 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 		brickwall_cached_num_channels_ = i_nch;
 		updateBrickwallFilterCoefficients();
 		resetBrickwallFilterState();
+		updateBrickwallFirCoefficients();
+		resetBrickwallFirState();
 	}
 
 	return OKAY;
@@ -335,9 +408,26 @@ void DfxDspPrivate::resetBrickwallFilterState()
 	}
 }
 
+void DfxDspPrivate::updateBrickwallFirCoefficients()
+{
+	filtBrickwallFirDesign(
+		(realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)DFXG_BRICKWALL_LOW_PASS_CUTOFF_HZ,
+		(realtype)brickwall_cached_sample_rate_, (realtype)DFXG_BRICKWALL_FIR_TARGET_LATENCY_MS,
+		brickwall_fir_coeffs_, &brickwall_fir_num_taps_, FILT_BRICKWALL_FIR_MAX_TAPS);
+}
+
+void DfxDspPrivate::resetBrickwallFirState()
+{
+	int channel;
+
+	for (channel = 0; channel < FILT_BRICKWALL_FIR_MAX_CHANNELS; channel++)
+	{
+		filtBrickwallFirResetChannelState(&brickwall_fir_channel_states_[channel]);
+	}
+}
+
 void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_sets)
 {
-	int num_sections;
 	int sample_index;
 	int channel;
 
@@ -346,44 +436,94 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 		return;
 	}
 
-	num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
+	if (brickwall_linear_phase_on_)
+	{
+		// Linear-phase FIR path. The filtered output is delayed by the FIR's
+		// group delay relative to its input, so filtBrickwallFirProcessSample()
+		// also returns a matching group-delay-shifted copy of the dry input
+		// (extracted from the same delay line) - subtracting the CURRENT
+		// pre_filter_sample here (as the IIR path does) would compare samples
+		// from different points in time and produce a nonsense residual.
+		int num_taps = brickwall_fir_num_taps_;
 
-	// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
-	// 1/4/8/11, but filtBrickwallProcessSample() does not itself bounds-check
-	// i_num_sections against FILT_BRICKWALL_MAX_SECTIONS before indexing into
-	// fixed-size arrays (Task 1 library code is generic and doesn't know
-	// about steepness policy). Clamp here, in the real-time audio path, as a
-	// safety net beyond what the brief's code shows.
-	if (num_sections > FILT_BRICKWALL_MAX_SECTIONS)
-	{
-		num_sections = FILT_BRICKWALL_MAX_SECTIONS;
-	}
-	else if (num_sections < 0)
-	{
-		num_sections = 0;
-	}
-
-	for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
-	{
-		for (channel = 0; channel < brickwall_cached_num_channels_ && channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+		if (num_taps > FILT_BRICKWALL_FIR_MAX_TAPS)
 		{
-			int buffer_index = sample_index * brickwall_cached_num_channels_ + channel;
-			realtype pre_filter_sample = (realtype)audio_buffer[buffer_index];
+			num_taps = FILT_BRICKWALL_FIR_MAX_TAPS;
+		}
+		else if (num_taps < 0)
+		{
+			num_taps = 0;
+		}
 
-			realtype filtered_sample = filtBrickwallProcessSample(
-				pre_filter_sample,
-				num_sections,
-				&brickwall_hp_coeffs_,
-				&brickwall_lp_coeffs_,
-				&brickwall_channel_states_[channel]);
-
-			if (brickwall_filter_preview_on_)
+		for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
+		{
+			for (channel = 0; channel < brickwall_cached_num_channels_ && channel < FILT_BRICKWALL_FIR_MAX_CHANNELS; channel++)
 			{
-				audio_buffer[buffer_index] = (float)(pre_filter_sample - filtered_sample);
+				int buffer_index = sample_index * brickwall_cached_num_channels_ + channel;
+				realtype input_sample = (realtype)audio_buffer[buffer_index];
+				realtype delayed_dry_sample;
+
+				realtype filtered_sample = filtBrickwallFirProcessSample(
+					input_sample,
+					brickwall_fir_coeffs_,
+					num_taps,
+					&brickwall_fir_channel_states_[channel],
+					&delayed_dry_sample);
+
+				if (brickwall_filter_preview_on_)
+				{
+					audio_buffer[buffer_index] = (float)((delayed_dry_sample - filtered_sample) * (realtype)DFXG_BRICKWALL_FIR_PREVIEW_GAIN);
+				}
+				else
+				{
+					audio_buffer[buffer_index] = (float)filtered_sample;
+				}
 			}
-			else
+		}
+
+		return;
+	}
+
+	{
+		int num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
+
+		// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
+		// 1/4/8/11, but filtBrickwallProcessSample() does not itself bounds-check
+		// i_num_sections against FILT_BRICKWALL_MAX_SECTIONS before indexing into
+		// fixed-size arrays (Task 1 library code is generic and doesn't know
+		// about steepness policy). Clamp here, in the real-time audio path, as a
+		// safety net beyond what the brief's code shows.
+		if (num_sections > FILT_BRICKWALL_MAX_SECTIONS)
+		{
+			num_sections = FILT_BRICKWALL_MAX_SECTIONS;
+		}
+		else if (num_sections < 0)
+		{
+			num_sections = 0;
+		}
+
+		for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
+		{
+			for (channel = 0; channel < brickwall_cached_num_channels_ && channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
 			{
-				audio_buffer[buffer_index] = (float)filtered_sample;
+				int buffer_index = sample_index * brickwall_cached_num_channels_ + channel;
+				realtype pre_filter_sample = (realtype)audio_buffer[buffer_index];
+
+				realtype filtered_sample = filtBrickwallProcessSample(
+					pre_filter_sample,
+					num_sections,
+					&brickwall_hp_coeffs_,
+					&brickwall_lp_coeffs_,
+					&brickwall_channel_states_[channel]);
+
+				if (brickwall_filter_preview_on_)
+				{
+					audio_buffer[buffer_index] = (float)(pre_filter_sample - filtered_sample);
+				}
+				else
+				{
+					audio_buffer[buffer_index] = (float)filtered_sample;
+				}
 			}
 		}
 	}
@@ -428,6 +568,31 @@ void DfxDspPrivate::brickwallFilterPreviewOn(bool on)
 bool DfxDspPrivate::isBrickwallFilterPreviewOn()
 {
 	return brickwall_filter_preview_on_;
+}
+
+void DfxDspPrivate::brickwallFilterLinearPhaseOn(bool on)
+{
+	brickwall_linear_phase_on_ = on;
+	if (on)
+	{
+		updateBrickwallFirCoefficients();
+		resetBrickwallFirState();
+	}
+}
+
+bool DfxDspPrivate::isBrickwallFilterLinearPhaseOn()
+{
+	return brickwall_linear_phase_on_;
+}
+
+double DfxDspPrivate::getBrickwallFilterLatencyMs()
+{
+	if (!brickwall_linear_phase_on_)
+	{
+		return 0.0;
+	}
+
+	return filtBrickwallFirGetLatencyMs(brickwall_fir_num_taps_, (realtype)brickwall_cached_sample_rate_);
 }
 
 

@@ -154,6 +154,9 @@ public:
 	void setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness);
 	bool isBrickwallFilterPreviewOn();
 	void setBrickwallFilterPreviewOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	void setBrickwallFilterLinearPhaseOn(bool on);
+	double getBrickwallFilterLatencyMs();
 
 	bool isLaunchOnStartup();
 	void setLaunchOnStartup(bool launch_on_startup);

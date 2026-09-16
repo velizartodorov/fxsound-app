@@ -744,6 +744,7 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		}
 
 		setBrickwallFilterSteepness(static_cast<DfxDsp::BrickwallSteepness>(settings_.getInt("brickwall_filter_steepness", static_cast<int>(DfxDsp::BrickwallSteepness::Standard))));
+		setBrickwallFilterLinearPhaseOn(settings_.getBool("brickwall_filter_linear_phase_on"));
 		setBrickwallFilterOn(settings_.getBool("brickwall_filter_on"));
 
 		setPowerState(settings_.getBool("power"));
@@ -2833,6 +2834,22 @@ bool FxController::isBrickwallFilterPreviewOn()
 void FxController::setBrickwallFilterPreviewOn(bool on)
 {
 	dfx_dsp_.brickwallFilterPreviewOn(on);
+}
+
+bool FxController::isBrickwallFilterLinearPhaseOn()
+{
+	return dfx_dsp_.isBrickwallFilterLinearPhaseOn();
+}
+
+void FxController::setBrickwallFilterLinearPhaseOn(bool on)
+{
+	dfx_dsp_.brickwallFilterLinearPhaseOn(on);
+	settings_.setBool("brickwall_filter_linear_phase_on", on);
+}
+
+double FxController::getBrickwallFilterLatencyMs()
+{
+	return dfx_dsp_.getBrickwallFilterLatencyMs();
 }
 
 bool FxController::isLaunchOnStartup()

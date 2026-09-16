@@ -54,6 +54,9 @@ public:
 	BrickwallSteepness getBrickwallFilterSteepness();
 	void brickwallFilterPreviewOn(bool on);
 	bool isBrickwallFilterPreviewOn();
+	void brickwallFilterLinearPhaseOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	double getBrickwallFilterLatencyMs();
 	float getBalance();
 	void setBalance(float gain_db);
 	float getNormalization();

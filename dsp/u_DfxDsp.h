@@ -26,6 +26,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "pt_defs.h"
 #include "slout.h"
 #include "FiltBrickwall.h"
+#include "FiltBrickwallFir.h"
 
 struct dfxg_section_type {
 	realtype value;
@@ -95,6 +96,9 @@ public:
 	DfxDsp::BrickwallSteepness getBrickwallFilterSteepness();
 	void brickwallFilterPreviewOn(bool on);
 	bool isBrickwallFilterPreviewOn();
+	void brickwallFilterLinearPhaseOn(bool on);
+	bool isBrickwallFilterLinearPhaseOn();
+	double getBrickwallFilterLatencyMs();
 	float getBalance();
 	void setBalance(float gain_db);
 	float getNormalization();
@@ -143,6 +147,10 @@ private:
 	void resetBrickwallFilterState();
 	void applyBrickwallFilter(float *audio_buffer, int num_sample_sets);
 
+	// Brickwall filter, linear-phase FIR mode (dsp/ptutil/include/FiltBrickwallFir.h)
+	void updateBrickwallFirCoefficients();
+	void resetBrickwallFirState();
+
 	// Handles
 	int *dfxp_handle_;
 	int *preset_list_handle_;
@@ -175,5 +183,10 @@ private:
 	FiltBrickwallBiquadCoeffs brickwall_hp_coeffs_;
 	FiltBrickwallBiquadCoeffs brickwall_lp_coeffs_;
 	FiltBrickwallChannelState brickwall_channel_states_[FILT_BRICKWALL_MAX_CHANNELS];
+
+	bool brickwall_linear_phase_on_ = false;
+	realtype brickwall_fir_coeffs_[FILT_BRICKWALL_FIR_MAX_TAPS];
+	int brickwall_fir_num_taps_ = 0;
+	FiltBrickwallFirChannelState brickwall_fir_channel_states_[FILT_BRICKWALL_FIR_MAX_CHANNELS];
 };
 
