@@ -34,8 +34,50 @@ namespace
 	constexpr float kVolumeLevelingMaxControlValue = 4.0f;
 	constexpr float kVolumeLevelingMaxTargetRms = 0.5f;
 
-	constexpr realtype k5BandDefaultFreqs[] = { 62.5f, 250.0f, 1000.0f, 4000.0f, 16000.0f };
+	constexpr realtype k5BandDefaultFreqs[] = { 63.0f, 250.0f, 1000.0f, 4000.0f, 16000.0f };
+	// Legacy (pre-ISO) 10 band frequencies. Matches the frequency grid the factory/community
+	// presets were authored against (geometric spacing, 62.5Hz to 16000Hz), not the ISO 266
+	// preferred numbers, so that existing presets' band frequencies line up with the rotary
+	// slider's band positions.
 	constexpr realtype k10BandDefaultFreqs[] = { 62.5f, 115.734f, 214.311f, 396.85f, 734.867f, 1360.79f, 2519.84f, 4666.12f, 8640.48f, 16000.0f };
+	// ISO 266 preferred numbers
+	constexpr realtype k15BandDefaultFreqs[] = {   25.0f,   40.0f,   63.0f,   100.0f,   160.0f, 250.0f, 400.0f, 630.0f, 1000.0f, 1600.0f,
+		                                          2500.0f, 4000.0f, 6300.0f, 10000.0f, 16000.0f };
+	constexpr realtype k20BandDefaultFreqs[] = {  20.0f,   31.5f,   40.0f,   63.0f,   80.0f,  125.0f,  160.0f,  250.0f,  315.0f,  500.0f,
+		                                         630.0f, 1000.0f, 1250.0f, 2000.0f, 2500.0f, 4000.0f, 5000.0f, 8000.0f, 10000.0f, 16000.0f };
+	constexpr realtype k31BandDefaultFreqs[] = {   20.0f,   25.0f,   31.5f,   40.0f,   50.0f,   63.0f,   80.0f,   100.0f,   125.0f,   160.0f,
+		                                          200.0f,  250.0f,  315.0f,  400.0f,  500.0f,  630.0f,  800.0f,  1000.0f,  1250.0f,  1600.0f,
+		                                         2000.0f, 2500.0f, 3150.0f, 4000.0f, 5000.0f, 6300.0f, 8000.0f, 10000.0f, 12500.0f, 16000.0f, 20000.0f };
+
+	// Single source of truth for the named band layouts (frequencies plus the min/max range
+	// they span). GraphicEqSetNumBands, GraphicEqReSetAllBandFreqs and GraphicEqGetDefaultBandFreq
+	// all read from this instead of each keeping their own copy of the same numbers.
+	struct DefaultBandLayoutType
+	{
+		int num_bands;
+		realtype min_freq;
+		realtype max_freq;
+		const realtype* freqs;
+	};
+
+	constexpr DefaultBandLayoutType kDefaultBandLayouts[] =
+	{
+		{  5,  63.0f, 16000.0f, k5BandDefaultFreqs },
+		{ 10,  62.5f, 16000.0f, k10BandDefaultFreqs },
+		{ 15,  25.0f, 16000.0f, k15BandDefaultFreqs },
+		{ 20,  20.0f, 16000.0f, k20BandDefaultFreqs },
+		{ 31,  20.0f, 20000.0f, k31BandDefaultFreqs },
+	};
+
+	const DefaultBandLayoutType* FindDefaultBandLayout(int num_bands)
+	{
+		for (const DefaultBandLayoutType& layout : kDefaultBandLayouts)
+		{
+			if (layout.num_bands == num_bands)
+				return &layout;
+		}
+		return NULL;
+	}
 }
 
 void PT_DECLSPEC GraphicEqSetBalance(PT_HANDLE* hp_GraphicEq, float balance_db)
@@ -168,28 +210,16 @@ int PT_DECLSPEC GraphicEqSetNumBands(PT_HANDLE* hp_GraphicEq, int num_bands)
 	// If no previous values were set, use defaults
 	if (min_freq <= 0 || max_freq <= 0)
 	{
-		switch (num_bands)
+		const DefaultBandLayoutType* layout = FindDefaultBandLayout(num_bands);
+		if (layout != NULL)
 		{
-		case 10:
-			min_freq = 62.5f;
-			max_freq = 16000.0f;
-			break;
-		case 15:
-			min_freq = 25.0f;
-			max_freq = 16000.0f;
-			break;
-		case 20:
-			min_freq = 20.0f;
-			max_freq = 16000.0f;
-			break;
-		case 31:
+			min_freq = layout->min_freq;
+			max_freq = layout->max_freq;
+		}
+		else
+		{
 			min_freq = 20.0f;
 			max_freq = 20000.0f;
-			break;
-		default:
-			min_freq = 20.0f;
-			max_freq = 20000.0f;
-			break;
 		}
 	}
 
@@ -395,99 +425,18 @@ int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_m
 			return(NOT_OKAY);
 	}
 	else
-	{		
-		// ==================================================================================
-		//  Corrected band limits and center frequencies (before version 2.0 they was wrong) 
-		// ==================================================================================
-
-		// ---------------------------------------------- 5 Bands (Q = 1)
-		// 62.5, 250, 1000, 4000, 16000
-		//cast_handle->max_band_freq = 16000;
-		//cast_handle->min_band_freq = 31.25;
-		//cast_handle->num_bands = 10;
-		// ---------------------------------------------- 10 Bands
-		// 62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0
-		//cast_handle->max_band_freq = 16000;
-		//cast_handle->min_band_freq = 31.25;
-		//cast_handle->num_bands = 10;
-		// ---------------------------------------------- ISO 15 Bands (Q = 2.14757848)
-		// 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000
-		//cast_handle->max_band_freq = 16000;
-		//cast_handle->min_band_freq = 25;
-		//cast_handle->num_bands = 15;
-		// ---------------------------------------------- ISO 20 Bands (Q = 2.82774258)
-		// 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 
-		// 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000
-		//cast_handle->max_band_freq = 16000;
-		//cast_handle->min_band_freq = 20;
-		//cast_handle->num_bands = 20;
-		// ---------------------------------------------- ISO 31 Bands (Q = 4.33336544)
-		// 20, 25, 31.5 40, 50, 63, 80, 100, 125, 160, 
-		// 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600,
-		// 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000
-		//cast_handle->max_band_freq = 20000;
-		//cast_handle->min_band_freq = 20;
-		//cast_handle->num_bands = 31;
-	    // --------------------------------------------------------------------------
-
-		if (cast_handle->num_bands == 5)
+	{
+		// Named band counts (5/10/15/20/31) use the fixed frequency/Q layouts in
+		// kDefaultBandLayouts above; any other band count falls back to the geometric
+		// spacing computed below.
+		const DefaultBandLayoutType* layout = FindDefaultBandLayout(cast_handle->num_bands);
+		if (layout != NULL)
 		{
-			cast_handle->max_band_freq = 16000;
-			cast_handle->min_band_freq = 62.5;
+			cast_handle->max_band_freq = layout->max_freq;
+			cast_handle->min_band_freq = layout->min_freq;
 			for (int i = 0; i < cast_handle->num_bands; i++)
 			{
-				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), k5BandDefaultFreqs[i]) != OKAY)
-					return(NOT_OKAY);
-			}
-		}
-		else if (cast_handle->num_bands == 10)
-		{
-			// ---------------------------------------------- Legacy (pre-ISO) 10 band frequencies.
-			// Matches the frequency grid the factory/community presets were authored against
-			// (geometric spacing, 62.5Hz to 16000Hz), not the ISO 266 preferred numbers, so that
-			// existing presets' band frequencies line up with the rotary slider's band positions.
-			cast_handle->max_band_freq = 16000;
-			cast_handle->min_band_freq = 62.5;
-			for (int i = 0; i < cast_handle->num_bands; i++)
-			{
-				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), k10BandDefaultFreqs[i]) != OKAY)
-					return(NOT_OKAY);
-			}
-		}
-		else if (cast_handle->num_bands == 15)
-		{
-			cast_handle->max_band_freq = 16000;
-			cast_handle->min_band_freq = 25;
-			realtype fCenter[] = {   25.0f,   40.0f,   63.0f,   100.0f,   160.0f, 250.0f, 400.0f, 630.0f, 1000.0f, 1600.0f, 
-				                   2500.0f, 4000.0f, 6300.0f, 10000.0f, 16000.0f };
-			for (int i = 0; i < cast_handle->num_bands; i++)
-			{
-				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), fCenter[i]) != OKAY)
-					return(NOT_OKAY);
-			}
-		}
-		else if (cast_handle->num_bands == 20)
-		{
-			cast_handle->max_band_freq = 16000;
-			cast_handle->min_band_freq = 20;
-			realtype fCenter[] = {  20.0f,   31.5f,   40.0f,   63.0f,   80.0f,  125.0f,  160.0f,  250.0f,  315.0f,  500.0f, 
-								   630.0f, 1000.0f, 1250.0f, 2000.0f, 2500.0f, 4000.0f, 5000.0f, 8000.0f, 10000.0f, 16000.0f };
-			for (int i = 0; i < cast_handle->num_bands; i++)
-			{
-				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), fCenter[i]) != OKAY)
-					return(NOT_OKAY);
-			}
-		}
-		else if (cast_handle->num_bands == 31)
-		{
-			cast_handle->max_band_freq = 20000;
-			cast_handle->min_band_freq = 20;
-			realtype fCenter[] = {   20.0f,   25.0f,   31.5f,   40.0f,   50.0f,   63.0f,   80.0f,   100.0f,   125.0f,   160.0f, 
-				                    200.0f,  250.0f,  315.0f,  400.0f,  500.0f,  630.0f,  800.0f,  1000.0f,  1250.0f,  1600.0f,
-				                   2000.0f, 2500.0f, 3150.0f, 4000.0f, 5000.0f, 6300.0f, 8000.0f, 10000.0f, 12500.0f, 16000.0f, 20000.0f };
-			for (int i = 0; i < cast_handle->num_bands; i++)
-			{
-				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), fCenter[i]) != OKAY)
+				if (GraphicEqSetBandFreq(hp_GraphicEq, (i + 1), layout->freqs[i]) != OKAY)
 					return(NOT_OKAY);
 			}
 		}
@@ -540,14 +489,10 @@ int PT_DECLSPEC GraphicEqGetDefaultBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_
 	if ((i_band_num <= 0) || (i_band_num > cast_handle->num_bands))
 		return(NOT_OKAY);
 
-	if (cast_handle->num_bands == 5)
+	const DefaultBandLayoutType* layout = FindDefaultBandLayout(cast_handle->num_bands);
+	if (layout != NULL)
 	{
-		*rp_band_freq = k5BandDefaultFreqs[i_band_num - 1];
-		return(OKAY);
-	}
-	else if (cast_handle->num_bands == 10)
-	{
-		*rp_band_freq = k10BandDefaultFreqs[i_band_num - 1];
+		*rp_band_freq = layout->freqs[i_band_num - 1];
 		return(OKAY);
 	}
 
