@@ -648,20 +648,13 @@ void FxEqualizer::FxBandCenterFreqSlider::mouseDown(const juce::MouseEvent& even
 
 void FxEqualizer::FxBandCenterFreqSlider::resetToDefaultFrequency()
 {
-    int nBands = FxController::getInstance().getNumEqBands();
-
+    // GraphicEqGetDefaultBandFreq (via getDefaultEqBandFrequency) covers every band
+    // count the UI allows (5/10/15/20/31 - see FxController::setNumEqBands), so this
+    // always succeeds in practice; if it ever doesn't, leave the value unchanged
+    // rather than guess a frequency.
     float default_freq;
     if (FxController::getInstance().getDefaultEqBandFrequency(band_, &default_freq))
     {
         setValue(default_freq, juce::NotificationType::sendNotification);
-    }
-    else if (nBands > 1)
-    {
-        // nBands - 1 guarded above: with a single band there's no spacing to
-        // compute, so just fall through and leave the value unchanged.
-        float min_freq = 20;
-        float max_freq = 20000;
-        int f = min_freq * pow((max_freq / min_freq), ((float)band_ / (nBands - 1)));
-        setValue(f, juce::NotificationType::sendNotification);
     }
 }
