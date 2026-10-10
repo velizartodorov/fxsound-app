@@ -118,6 +118,55 @@ struct BrickwallIirExchange {
 	std::atomic<int> middle_slot;
 };
 
+/* What the low cut filter's output is currently made of (audio thread). */
+#define BRICKWALL_SOURCE_DRY  0   /* unfiltered input: filter or power off, or nothing ready */
+#define BRICKWALL_SOURCE_IIR  1   /* Zero Latency cascade */
+#define BRICKWALL_SOURCE_FIR  2   /* the active Linear Phase engine */
+
+/* Transition lengths. Dry <-> IIR (both zero latency) and preview on/off are
+ * crossfades; anything involving a Linear Phase engine fades out to silence
+ * and the new source back in. */
+#define BRICKWALL_CROSSFADE_MS  20.0
+#define BRICKWALL_FADE_MS       10.0
+
+/*
+ * All audio-thread state of the low cut filter's output stage (see
+ * applyBrickwallFilter() and brickwallRunSegment() in DfxDspPrivate.cpp for
+ * the transition state machine). Nothing here is touched by any other thread.
+ * Every ramp is an integer frame position, so its end falls on an exact frame.
+ */
+struct BrickwallAudioState {
+	/* Ramp lengths in frames, for ramp_rate (BRICKWALL_CROSSFADE_MS/FADE_MS). */
+	int ramp_rate;                /* -1 = not computed yet */
+	int crossfade_frames;
+	int fade_frames;
+
+	/* Output source state machine. */
+	int source;                   /* BRICKWALL_SOURCE_* currently playing */
+	int crossfade_from;           /* source being crossfaded out (Dry <-> IIR only), -1 = none */
+	int crossfade_pos;            /* 0..crossfade_frames: weight of `source` */
+	int gain_pos;                 /* 0..fade_frames: gain of `source` (fade out/in) */
+	int gain_dir;                 /* -1 fading out, +1 fading in, 0 steady */
+
+	/* Preview ("hear what's removed") crossfade and auto-leveller. */
+	int preview_pos;              /* 0..crossfade_frames: weight of the preview */
+	bool preview_was_on;
+	float preview_mean_square;
+	float preview_gain;
+	BrickwallPreviewLevelCoeffs preview_level_coeffs;
+
+	/* Zero Latency (IIR) cascade: two parameter sets and two histories, so a
+	 * parameter change crossfades from the current set (iir_cur) to the
+	 * incoming one (iir_cur ^ 1). Parameter sets are copies taken from
+	 * BrickwallIirExchange, owned by the audio thread. */
+	BrickwallIirParams iir_params[2];
+	FiltBrickwallChannelState iir_states[2][FILT_BRICKWALL_MAX_CHANNELS];
+	int iir_cur;
+	bool iir_crossfading;
+	int iir_crossfade_pos;        /* 0..crossfade_frames: weight of the incoming set */
+	bool iir_running;             /* history is being fed continuously; false = stale */
+};
+
 class DfxDspPrivate
 {
 public:
@@ -200,6 +249,7 @@ private:
 	void requestBrickwallDesign(bool wake_designer);
 	void brickwallDesignerThreadMain();
 	void adoptPendingBrickwallFirEngine();
+	int brickwallDesiredSource(bool filter_on, int processed_channels);
 
 	// Handles
 	int *dfxp_handle_;
@@ -232,13 +282,6 @@ private:
 	// FxSound's power state as seen by the low cut filter: powerOn(false)
 	// bypasses it along with the effects.
 	std::atomic<bool> brickwall_power_on_{ true };
-	// Preview auto-leveller state (audio thread only; see
-	// brickwallLevelPreviewFrame() in DfxDspPrivate.cpp).
-	float brickwall_preview_mean_square_ = 0.0f;
-	float brickwall_preview_gain_ = 1.0f;
-	bool brickwall_preview_was_on_ = false;
-	BrickwallPreviewLevelCoeffs brickwall_preview_level_coeffs_ = {};
-	int brickwall_preview_level_coeffs_rate_ = -1; // sample rate the coefficients above are for; -1 = not computed (audio thread only)
 	// Settings written by the UI thread and read by the designer thread.
 	std::atomic<int> brickwall_filter_steepness_{ DfxDsp::BrickwallSteepness::Standard };
 	std::atomic<float> brickwall_hp_cutoff_hz_{ 20.0f }; // 0 = high-pass band bypassed
@@ -249,14 +292,11 @@ private:
 
 	// Zero Latency (IIR) hand-off: the designer thread publishes immutable
 	// parameter sets into brickwall_iir_exchange_; the audio thread adopts the
-	// newest one at the start of each buffer. Everything below the exchange is
-	// audio thread only, so the cascade's history is only ever reset there.
+	// newest one (when it isn't crossfading) into brickwall_audio_. The output
+	// stage state is audio thread only, so the cascade's history is only ever
+	// reset there.
 	BrickwallIirExchange brickwall_iir_exchange_;
-	FiltBrickwallChannelState brickwall_channel_states_[FILT_BRICKWALL_MAX_CHANNELS];
-	unsigned int brickwall_iir_history_serial_ = 0; // reset_serial of the set the history was last reset for
-	int brickwall_iir_history_hp_sections_ = -1;    // section counts the history belongs to
-	int brickwall_iir_history_lp_sections_ = -1;
-	bool brickwall_iir_ran_last_buffer_ = false;    // false whenever the IIR path skipped a buffer
+	BrickwallAudioState brickwall_audio_;
 
 	// Linear-phase engine hand-off. The UI and audio threads only store and
 	// exchange these atomics; brickwall_designer_thread_ does all design and

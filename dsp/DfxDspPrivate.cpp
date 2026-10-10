@@ -252,7 +252,8 @@ static void brickwallDesignIirParams(int sample_rate, int steepness, float cutof
  *   fills its back slot, then swaps it into the middle with the dirty bit set
  *   (release). Adopt: audio thread only (the single consumer); if the middle
  *   is dirty it swaps its front slot in for it (acquire), and it always
- *   returns the front slot, which nothing else writes while it is the front.
+ *   returns the front slot, which nothing else writes while it is the front;
+ *   *bp_took_new (if non-NULL) says whether that is a newly published set.
  *   Atomic loads/exchanges only - real-time safe. Before the first publish the
  *   front set has sample_rate 0, which never matches a real format.
  */
@@ -276,12 +277,19 @@ static void brickwallIirExchangePublish(BrickwallIirExchange *exchange, const Br
 	exchange->back_slot = previous & BRICKWALL_IIR_SLOT_MASK;
 }
 
-static const BrickwallIirParams *brickwallIirExchangeAdopt(BrickwallIirExchange *exchange)
+static const BrickwallIirParams *brickwallIirExchangeAdopt(BrickwallIirExchange *exchange, bool *bp_took_new)
 {
+	bool took_new = false;
+
 	if (exchange->middle_slot.load(std::memory_order_relaxed) & BRICKWALL_IIR_SLOT_DIRTY)
 	{
 		int previous = exchange->middle_slot.exchange(exchange->front_slot, std::memory_order_acq_rel);
 		exchange->front_slot = previous & BRICKWALL_IIR_SLOT_MASK;
+		took_new = true;
+	}
+	if (bp_took_new != NULL)
+	{
+		*bp_took_new = took_new;
 	}
 
 	return &exchange->slots[exchange->front_slot];
@@ -290,14 +298,14 @@ static const BrickwallIirParams *brickwallIirExchangeAdopt(BrickwallIirExchange 
 /*
  * FUNCTION: brickwallIirNeedsReset()
  * DESCRIPTION:
- *   Audio thread: whether the IIR cascade's history must be cleared before
- *   running the parameter set *params. It must when the set belongs to a newer
- *   reset serial (filter on, power on, format change), when the section counts
+ *   Audio thread: whether the IIR cascade's history can't be carried over to
+ *   the parameter set *params. It can't when the set belongs to a newer reset
+ *   serial (filter on, power on, format change), when the section counts
  *   changed (steepness change, or a 0Hz cutoff bypass toggled), or when the
- *   IIR path skipped the previous buffer (linear phase was on, the filter or
- *   power was off, or no matching set was ready), since its history is then
- *   stale. A cutoff-only change keeps the history, so dragging the cutoff
- *   slider doesn't click.
+ *   IIR path wasn't running (linear phase was on, the filter or power was
+ *   off, or no matching set was ready), since its history is then stale. A
+ *   cutoff-only change keeps the history. Either way the change is
+ *   crossfaded (see brickwallIirPoll()).
  */
 static bool brickwallIirNeedsReset(const BrickwallIirParams *params, unsigned int history_serial,
 	int history_hp_sections, int history_lp_sections, bool ran_last_buffer)
@@ -306,6 +314,659 @@ static bool brickwallIirNeedsReset(const BrickwallIirParams *params, unsigned in
 		params->reset_serial != history_serial ||
 		params->num_hp_sections != history_hp_sections ||
 		params->num_lp_sections != history_lp_sections;
+}
+
+/*
+ * Low cut filter output stage: transitions.
+ *
+ * Every change of what the filter outputs is ramped, per sample, on the audio
+ * thread; nothing here allocates, locks, designs filters or makes system
+ * calls, and all of its state (BrickwallAudioState, u_DfxDsp.h) is audio
+ * thread only. Ramp lengths come from the cached sample rate
+ * (brickwallAudioStateSetRate()). Extra work is done only while a ramp runs.
+ *
+ * Output source state machine. The source is Dry (filter or power off, or
+ * nothing ready yet), IIR (Zero Latency) or FIR (the active Linear Phase
+ * engine). Each segment (a run of frames in which no ramp ends) starts by
+ * comparing the desired source with the current one (brickwallStepSource()):
+ *
+ *   - Dry <-> IIR, current source at full gain: crossfade over
+ *     BRICKWALL_CROSSFADE_MS, running both (crossfade_from = the old one). If
+ *     the old source is wanted again mid-way, the crossfade reverses from
+ *     where it is; any other change waits until it has finished.
+ *   - Anything involving FIR (Dry/IIR -> FIR, FIR -> Dry/IIR, one engine to
+ *     another), or a change while the current source isn't at full gain:
+ *     fade the current source out over BRICKWALL_FADE_MS (it keeps running
+ *     while it fades), switch while silent, fade the new source in. A FIR
+ *     engine's fade-in ramps its input rather than its output: a fresh engine
+ *     outputs (nearly) nothing for its latency and would then start abruptly
+ *     on whatever the input was doing; ramping the input makes the delayed
+ *     onset itself a fade. That fade-in always completes before a fade-out.
+ *   - Dry at full gain, nothing wanted and the preview off: the stage is idle
+ *     and returns at once, at no cost.
+ *
+ * Within the IIR source, a new parameter set (cutoff or steepness change) is
+ * crossfaded from the current set to the incoming one over
+ * BRICKWALL_CROSSFADE_MS, both running; the incoming history starts as a
+ * copy of the current one when the section counts and reset serial match
+ * (cutoff-only change) and from zero otherwise. No other set is adopted
+ * until the crossfade ends, so a cutoff drag follows in ~20ms steps.
+ *
+ * The preview mixes the normal output with the auto-levelled "what's
+ * removed" signal (IIR: the complementary low-pass; FIR: delayed dry minus
+ * filtered; Dry: nothing), crossfading over BRICKWALL_CROSSFADE_MS when it is
+ * switched on or off.
+ *
+ * Reset guarantees are unchanged: the IIR history is cleared whenever the
+ * IIR source starts after not running, and a FIR engine is only switched to
+ * when it carries the current reset serial (it is never fed while it isn't
+ * the source, and is retired or invalidated before it could be played again).
+ */
+
+/*
+ * FUNCTION: brickwallRampWeight()  [internal]
+ * DESCRIPTION:
+ *   Weight pos/len of a linear ramp; exactly 1 at its end.
+ */
+static inline float brickwallRampWeight(int pos, int len, float step)
+{
+	return (pos >= len) ? 1.0f : (float)pos * step;
+}
+
+/*
+ * FUNCTION: brickwallRescaleRamp()  [internal]
+ * DESCRIPTION:
+ *   Moves a ramp position to a new ramp length, keeping its proportion (an
+ *   ended ramp stays ended).
+ */
+static int brickwallRescaleRamp(int pos, int old_len, int new_len)
+{
+	if (old_len <= 0 || pos >= old_len)
+	{
+		return (pos > 0) ? new_len : 0;
+	}
+
+	return (int)(((long long)pos * (long long)new_len) / (long long)old_len);
+}
+
+/*
+ * FUNCTION: brickwallAudioStateInit()
+ * DESCRIPTION:
+ *   Initial output stage: Dry at full gain, idle, no IIR parameter set.
+ */
+static void brickwallAudioStateInit(BrickwallAudioState *state)
+{
+	int slot, channel;
+
+	state->ramp_rate = -1;
+	state->crossfade_frames = 1;
+	state->fade_frames = 1;
+	state->source = BRICKWALL_SOURCE_DRY;
+	state->crossfade_from = -1;
+	state->crossfade_pos = 0;
+	state->gain_pos = state->fade_frames;
+	state->gain_dir = 0;
+	state->preview_pos = 0;
+	state->preview_was_on = false;
+	state->preview_mean_square = 0.0f;
+	state->preview_gain = 1.0f;
+	state->preview_level_coeffs = {};
+	for (slot = 0; slot < 2; slot++)
+	{
+		state->iir_params[slot] = {};
+		for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+		{
+			filtBrickwallResetChannelState(&state->iir_states[slot][channel]);
+		}
+	}
+	state->iir_cur = 0;
+	state->iir_crossfading = false;
+	state->iir_crossfade_pos = 0;
+	state->iir_running = false;
+}
+
+/*
+ * FUNCTION: brickwallAudioStateSetRate()
+ * DESCRIPTION:
+ *   Recomputes the ramp lengths and the preview leveller's coefficients when
+ *   the sample rate changes (cached per rate, like the leveller coefficients
+ *   were; the exp() calls only run on a rate change). Ramps in progress keep
+ *   their proportion.
+ */
+static void brickwallAudioStateSetRate(BrickwallAudioState *state, int sample_rate)
+{
+	double fs;
+	int crossfade_frames, fade_frames;
+
+	if (sample_rate == state->ramp_rate)
+	{
+		return;
+	}
+
+	fs = (sample_rate > 0) ? (double)sample_rate : 44100.0;
+	crossfade_frames = (int)(fs * BRICKWALL_CROSSFADE_MS / 1000.0 + 0.5);
+	fade_frames = (int)(fs * BRICKWALL_FADE_MS / 1000.0 + 0.5);
+	if (crossfade_frames < 1)
+	{
+		crossfade_frames = 1;
+	}
+	if (fade_frames < 1)
+	{
+		fade_frames = 1;
+	}
+
+	state->crossfade_pos = brickwallRescaleRamp(state->crossfade_pos, state->crossfade_frames, crossfade_frames);
+	state->preview_pos = brickwallRescaleRamp(state->preview_pos, state->crossfade_frames, crossfade_frames);
+	state->iir_crossfade_pos = brickwallRescaleRamp(state->iir_crossfade_pos, state->crossfade_frames, crossfade_frames);
+	state->gain_pos = brickwallRescaleRamp(state->gain_pos, state->fade_frames, fade_frames);
+	state->crossfade_frames = crossfade_frames;
+	state->fade_frames = fade_frames;
+
+	state->preview_level_coeffs = brickwallPreviewLevelCoeffs(sample_rate);
+	state->ramp_rate = sample_rate;
+}
+
+/*
+ * FUNCTION: brickwallIirCopyParams()  [internal]
+ * DESCRIPTION:
+ *   Takes the audio thread's own copy of a published parameter set, with the
+ *   section counts clamped to FILT_BRICKWALL_MAX_SECTIONS: brickwallNum-
+ *   SectionsForSteepness() only returns 1/4/8/11, but filtBrickwallProcess-
+ *   Sample() indexes fixed-size arrays without checking, so this is a safety
+ *   net.
+ */
+static void brickwallIirCopyParams(BrickwallIirParams *dst, const BrickwallIirParams *src)
+{
+	*dst = *src;
+	if (dst->num_hp_sections > FILT_BRICKWALL_MAX_SECTIONS)
+	{
+		dst->num_hp_sections = FILT_BRICKWALL_MAX_SECTIONS;
+	}
+	else if (dst->num_hp_sections < 0)
+	{
+		dst->num_hp_sections = 0;
+	}
+	if (dst->num_lp_sections > FILT_BRICKWALL_MAX_SECTIONS)
+	{
+		dst->num_lp_sections = FILT_BRICKWALL_MAX_SECTIONS;
+	}
+	else if (dst->num_lp_sections < 0)
+	{
+		dst->num_lp_sections = 0;
+	}
+}
+
+/*
+ * FUNCTION: brickwallIirFinishCrossfade()  [internal]
+ * DESCRIPTION:
+ *   Makes the incoming IIR set (and its history) the current one.
+ */
+static void brickwallIirFinishCrossfade(BrickwallAudioState *state)
+{
+	state->iir_cur ^= 1;
+	state->iir_crossfading = false;
+	state->iir_crossfade_pos = 0;
+}
+
+/*
+ * FUNCTION: brickwallIirPoll()
+ * DESCRIPTION:
+ *   Adopts the newest published IIR parameter set, unless a parameter
+ *   crossfade is still running (the set then waits in the exchange and the
+ *   newest one is taken when it ends). A set for another sample rate or an
+ *   older reset serial is stale and ignored (a fresh one always follows).
+ *   While the cascade isn't running, the set simply becomes the current one
+ *   (its history is cleared when it starts, see brickwallIirStart()). While
+ *   it runs, the set becomes the incoming one and a crossfade starts; its
+ *   history is a copy of the current one for a cutoff-only change, and empty
+ *   otherwise (see brickwallIirNeedsReset()). The copies are plain structs:
+ *   no allocation.
+ */
+static void brickwallIirPoll(BrickwallAudioState *state, BrickwallIirExchange *exchange, int sample_rate, unsigned int reset_serial)
+{
+	const BrickwallIirParams *published;
+	const BrickwallIirParams *current;
+	bool took_new = false;
+	int next, channel;
+
+	if (state->iir_crossfading)
+	{
+		return;
+	}
+
+	published = brickwallIirExchangeAdopt(exchange, &took_new);
+	if (!took_new || published->sample_rate != sample_rate || published->reset_serial != reset_serial)
+	{
+		return;
+	}
+
+	if (!state->iir_running)
+	{
+		brickwallIirCopyParams(&state->iir_params[state->iir_cur], published);
+		return;
+	}
+
+	next = state->iir_cur ^ 1;
+	current = &state->iir_params[state->iir_cur];
+	brickwallIirCopyParams(&state->iir_params[next], published);
+	if (brickwallIirNeedsReset(&state->iir_params[next], current->reset_serial, current->num_hp_sections,
+		current->num_lp_sections, true))
+	{
+		for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+		{
+			filtBrickwallResetChannelState(&state->iir_states[next][channel]);
+		}
+	}
+	else
+	{
+		for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+		{
+			state->iir_states[next][channel] = state->iir_states[state->iir_cur][channel];
+		}
+	}
+	state->iir_crossfading = true;
+	state->iir_crossfade_pos = 0;
+}
+
+/*
+ * FUNCTION: brickwallIirReady()
+ * DESCRIPTION:
+ *   Whether the IIR set the cascade is (or will be, once a crossfade ends)
+ *   running was designed for this sample rate and reset serial.
+ */
+static bool brickwallIirReady(const BrickwallAudioState *state, int sample_rate, unsigned int reset_serial)
+{
+	const BrickwallIirParams *params = &state->iir_params[state->iir_crossfading ? (state->iir_cur ^ 1) : state->iir_cur];
+
+	return params->sample_rate == sample_rate && params->reset_serial == reset_serial;
+}
+
+/*
+ * FUNCTION: brickwallIirStart() / brickwallIirStop()
+ * DESCRIPTION:
+ *   The cascade starts with cleared history whenever it starts feeding again
+ *   after a gap; when it stops, any parameter crossfade is completed at once
+ *   (its history no longer matters).
+ */
+static void brickwallIirStart(BrickwallAudioState *state)
+{
+	int channel;
+
+	if (state->iir_running)
+	{
+		return;
+	}
+	if (state->iir_crossfading)
+	{
+		brickwallIirFinishCrossfade(state);
+	}
+	for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+	{
+		filtBrickwallResetChannelState(&state->iir_states[state->iir_cur][channel]);
+	}
+	state->iir_running = true;
+}
+
+static void brickwallIirStop(BrickwallAudioState *state)
+{
+	if (state->iir_crossfading)
+	{
+		brickwallIirFinishCrossfade(state);
+	}
+	state->iir_running = false;
+}
+
+/*
+ * FUNCTION: brickwallIirRunChannel()  [internal]
+ * DESCRIPTION:
+ *   Runs one sample of one channel through the current IIR set: the
+ *   high-pass (the filter) and the complementary low-pass (the preview, see
+ *   brickwallDesignIirParams()) both run on every sample, with separate
+ *   histories, so toggling the preview never starts either from stale
+ *   history. During a parameter crossfade the incoming set runs too and both
+ *   outputs are blended with r_incoming_weight.
+ */
+static inline void brickwallIirRunChannel(BrickwallAudioState *state, int channel, realtype r_input, float r_incoming_weight,
+	float *fp_filtered, float *fp_removed)
+{
+	const BrickwallIirParams *params = &state->iir_params[state->iir_cur];
+	FiltBrickwallChannelState *history = &state->iir_states[state->iir_cur][channel];
+	float filtered, removed;
+
+	filtered = (float)filtBrickwallProcessSample(r_input, params->num_hp_sections, 0, &params->hp_coeffs, &params->lp_coeffs, history);
+	removed = (params->num_lp_sections > 0) ?
+		(float)filtBrickwallProcessSample(r_input, 0, params->num_lp_sections, &params->hp_coeffs, &params->lp_coeffs, history) : 0.0f;
+
+	if (state->iir_crossfading)
+	{
+		const int next = state->iir_cur ^ 1;
+		const BrickwallIirParams *incoming = &state->iir_params[next];
+		FiltBrickwallChannelState *incoming_history = &state->iir_states[next][channel];
+		float incoming_filtered, incoming_removed;
+
+		incoming_filtered = (float)filtBrickwallProcessSample(r_input, incoming->num_hp_sections, 0,
+			&incoming->hp_coeffs, &incoming->lp_coeffs, incoming_history);
+		incoming_removed = (incoming->num_lp_sections > 0) ?
+			(float)filtBrickwallProcessSample(r_input, 0, incoming->num_lp_sections, &incoming->hp_coeffs, &incoming->lp_coeffs, incoming_history) : 0.0f;
+		filtered += r_incoming_weight * (incoming_filtered - filtered);
+		removed += r_incoming_weight * (incoming_removed - removed);
+	}
+
+	*fp_filtered = filtered;
+	*fp_removed = removed;
+}
+
+/*
+ * FUNCTION: brickwallSettleRamps()  [internal]
+ * DESCRIPTION:
+ *   Ends every ramp that has reached its end.
+ */
+static void brickwallSettleRamps(BrickwallAudioState *state)
+{
+	if (state->crossfade_from >= 0 && state->crossfade_pos >= state->crossfade_frames)
+	{
+		state->crossfade_from = -1;
+		state->crossfade_pos = 0;
+	}
+	if ((state->gain_dir > 0 && state->gain_pos >= state->fade_frames) || (state->gain_dir < 0 && state->gain_pos <= 0))
+	{
+		state->gain_dir = 0;
+	}
+	if (state->iir_crossfading && state->iir_crossfade_pos >= state->crossfade_frames)
+	{
+		brickwallIirFinishCrossfade(state);
+	}
+}
+
+/*
+ * FUNCTION: brickwallStepSource()
+ * DESCRIPTION:
+ *   One step of the output source state machine (see the overview above),
+ *   at the start of a segment. Returns true if it switched source while
+ *   silent: the caller then re-evaluates the desired source before running
+ *   (the switch itself can make a pending engine adoptable).
+ */
+static bool brickwallStepSource(BrickwallAudioState *state, int desired)
+{
+	brickwallSettleRamps(state);
+
+	if (state->crossfade_from >= 0)
+	{
+		// Dry <-> IIR crossfade running: reverse it if the old source is wanted
+		// again, otherwise let it finish first.
+		if (desired == state->crossfade_from)
+		{
+			state->crossfade_from = state->source;
+			state->source = desired;
+			state->crossfade_pos = state->crossfade_frames - state->crossfade_pos;
+			brickwallSettleRamps(state);
+		}
+		return false;
+	}
+
+	if (state->source == BRICKWALL_SOURCE_FIR && state->gain_dir > 0)
+	{
+		// A Linear Phase fade-in ramps the engine's input: let it complete.
+		return false;
+	}
+
+	if (desired == state->source)
+	{
+		state->gain_dir = (state->gain_pos < state->fade_frames) ? 1 : 0;
+		return false;
+	}
+
+	if (state->gain_pos >= state->fade_frames &&
+		state->source != BRICKWALL_SOURCE_FIR && desired != BRICKWALL_SOURCE_FIR)
+	{
+		state->crossfade_from = state->source;
+		state->source = desired;
+		state->crossfade_pos = 0;
+		state->gain_dir = 0;
+		return false;
+	}
+
+	if (state->gain_pos > 0)
+	{
+		state->gain_dir = -1;
+		return false;
+	}
+
+	state->source = desired;
+	state->gain_dir = 1;
+	return true;
+}
+
+/*
+ * FUNCTION: brickwallRunSegment()
+ * DESCRIPTION:
+ *   Processes frames in place, up to i_num_frames but stopping where any ramp
+ *   ends (so the caller can step the state machine there). Returns the number
+ *   of frames processed (at least 1). sp_engine is the engine to run while
+ *   the source is FIR (NULL otherwise). The first i_processed_channels
+ *   channels of each frame are processed; the rest pass through. Real-time
+ *   safe: arithmetic, the IIR cascade and filtPartConvProcessFrame() only.
+ */
+static int brickwallRunSegment(BrickwallAudioState *state, FiltPartConv *sp_engine, float *fp_buffer, int i_num_frames,
+	int i_num_channels, int i_processed_channels, bool b_preview_on)
+{
+	const float crossfade_step = 1.0f / (float)state->crossfade_frames;
+	const float fade_step = 1.0f / (float)state->fade_frames;
+	const bool run_iir = state->source == BRICKWALL_SOURCE_IIR || state->crossfade_from == BRICKWALL_SOURCE_IIR;
+	const bool run_fir = state->source == BRICKWALL_SOURCE_FIR && sp_engine != NULL;
+	const int fir_channels = run_fir ? sp_engine->num_channels : 0;
+	const bool crossfading = state->crossfade_from >= 0;
+	bool fir_fading_in;
+	int preview_dir = 0;
+	int segment = i_num_frames;
+	int n, channel;
+
+	brickwallSettleRamps(state);
+	if (run_iir)
+	{
+		brickwallIirStart(state);
+	}
+	else
+	{
+		brickwallIirStop(state);
+	}
+	fir_fading_in = run_fir && state->gain_dir > 0;
+
+	if (b_preview_on && state->preview_pos < state->crossfade_frames)
+	{
+		preview_dir = 1;
+	}
+	else if (!b_preview_on && state->preview_pos > 0)
+	{
+		preview_dir = -1;
+	}
+
+	// The segment ends where the first ramp ends.
+	if (crossfading && state->crossfade_frames - state->crossfade_pos < segment)
+	{
+		segment = state->crossfade_frames - state->crossfade_pos;
+	}
+	if (state->gain_dir > 0 && state->fade_frames - state->gain_pos < segment)
+	{
+		segment = state->fade_frames - state->gain_pos;
+	}
+	else if (state->gain_dir < 0 && state->gain_pos < segment)
+	{
+		segment = state->gain_pos;
+	}
+	if (preview_dir > 0 && state->crossfade_frames - state->preview_pos < segment)
+	{
+		segment = state->crossfade_frames - state->preview_pos;
+	}
+	else if (preview_dir < 0 && state->preview_pos < segment)
+	{
+		segment = state->preview_pos;
+	}
+	if (state->iir_crossfading && state->crossfade_frames - state->iir_crossfade_pos < segment)
+	{
+		segment = state->crossfade_frames - state->iir_crossfade_pos;
+	}
+	if (segment < 1)
+	{
+		segment = 1; // defensive: settled ramps never leave 0 frames
+	}
+
+	for (n = 0; n < segment; n++)
+	{
+		float *frame = &fp_buffer[(size_t)n * (size_t)i_num_channels];
+		float filtered[FILT_BRICKWALL_MAX_CHANNELS];
+		float removed[FILT_BRICKWALL_MAX_CHANNELS];
+		float fir_frame[FILT_PART_CONV_MAX_CHANNELS];
+		float fir_dry[FILT_PART_CONV_MAX_CHANNELS];
+		float weights[3] = { 0.0f, 0.0f, 0.0f }; // per BRICKWALL_SOURCE_*
+		float current_weight, fir_input_gain = 1.0f;
+		float preview_mix, iir_incoming_weight;
+
+		if (crossfading)
+		{
+			state->crossfade_pos++;
+			current_weight = brickwallRampWeight(state->crossfade_pos, state->crossfade_frames, crossfade_step);
+			weights[state->crossfade_from] = 1.0f - current_weight;
+		}
+		else
+		{
+			state->gain_pos += state->gain_dir;
+			current_weight = brickwallRampWeight(state->gain_pos, state->fade_frames, fade_step);
+		}
+		if (fir_fading_in)
+		{
+			fir_input_gain = current_weight;
+			current_weight = 1.0f;
+		}
+		weights[state->source] += current_weight;
+
+		state->preview_pos += preview_dir;
+		preview_mix = brickwallRampWeight(state->preview_pos, state->crossfade_frames, crossfade_step);
+		if (state->iir_crossfading)
+		{
+			state->iir_crossfade_pos++;
+		}
+		iir_incoming_weight = brickwallRampWeight(state->iir_crossfade_pos, state->crossfade_frames, crossfade_step);
+
+		if (run_fir)
+		{
+			for (channel = 0; channel < fir_channels; channel++)
+			{
+				fir_frame[channel] = (channel < i_processed_channels) ? frame[channel] * fir_input_gain : 0.0f;
+			}
+			filtPartConvProcessFrame(sp_engine, fir_frame, fir_dry);
+		}
+
+		for (channel = 0; channel < i_processed_channels; channel++)
+		{
+			float input = frame[channel];
+			float out_filtered = weights[BRICKWALL_SOURCE_DRY] * input;
+			float out_removed = 0.0f; // Dry removes nothing
+
+			if (run_iir)
+			{
+				float iir_filtered, iir_removed;
+
+				brickwallIirRunChannel(state, channel, (realtype)input, iir_incoming_weight, &iir_filtered, &iir_removed);
+				out_filtered += weights[BRICKWALL_SOURCE_IIR] * iir_filtered;
+				out_removed += weights[BRICKWALL_SOURCE_IIR] * iir_removed;
+			}
+			if (channel < fir_channels)
+			{
+				out_filtered += weights[BRICKWALL_SOURCE_FIR] * fir_frame[channel];
+				out_removed += weights[BRICKWALL_SOURCE_FIR] * (fir_dry[channel] - fir_frame[channel]);
+			}
+			filtered[channel] = out_filtered;
+			removed[channel] = out_removed;
+		}
+
+		if (state->preview_pos > 0)
+		{
+			brickwallLevelPreviewFrame(removed, i_processed_channels, &state->preview_level_coeffs,
+				&state->preview_mean_square, &state->preview_gain);
+			for (channel = 0; channel < i_processed_channels; channel++)
+			{
+				frame[channel] = filtered[channel] + preview_mix * (removed[channel] - filtered[channel]);
+			}
+		}
+		else
+		{
+			for (channel = 0; channel < i_processed_channels; channel++)
+			{
+				frame[channel] = filtered[channel];
+			}
+		}
+	}
+
+	brickwallSettleRamps(state);
+	return segment;
+}
+
+/*
+ * FUNCTION: brickwallProcessBuffer()
+ * DESCRIPTION:
+ *   Runs the output stage over one interleaved buffer: adopts a new IIR set
+ *   if one is waiting, asks desired_source() (which returns a
+ *   BRICKWALL_SOURCE_* and may adopt a pending Linear Phase engine - it must
+ *   only do so while the current source isn't FIR) what should be playing,
+ *   returns at once if the stage is idle, and otherwise processes the buffer
+ *   segment by segment, stepping the state machine between segments.
+ *   *spp_engine is read when the source is FIR. Restarts the preview's
+ *   auto-leveller from 0dB when the preview is switched on from fully off.
+ *   Real-time safe.
+ */
+template <typename DesiredSourceFn>
+static void brickwallProcessBuffer(BrickwallAudioState *state, BrickwallIirExchange *exchange, int sample_rate,
+	unsigned int reset_serial, FiltPartConv *const *spp_engine, float *fp_buffer, int i_num_frames, int i_num_channels,
+	bool b_preview_on, DesiredSourceFn desired_source)
+{
+	const int processed_channels = (i_num_channels < FILT_BRICKWALL_MAX_CHANNELS) ? i_num_channels : FILT_BRICKWALL_MAX_CHANNELS;
+	int frame = 0;
+	int desired;
+
+	if (i_num_channels <= 0 || i_num_frames <= 0)
+	{
+		return;
+	}
+
+	brickwallAudioStateSetRate(state, sample_rate);
+	brickwallIirPoll(state, exchange, sample_rate, reset_serial);
+	desired = desired_source();
+
+	if (state->source == BRICKWALL_SOURCE_DRY && desired == BRICKWALL_SOURCE_DRY && state->crossfade_from < 0 &&
+		state->gain_pos >= state->fade_frames && state->preview_pos == 0 && !b_preview_on)
+	{
+		brickwallIirStop(state);
+		state->gain_dir = 0;
+		state->preview_was_on = false;
+		return;
+	}
+
+	if (b_preview_on && !state->preview_was_on && state->preview_pos == 0)
+	{
+		state->preview_mean_square = 0.0f;
+		state->preview_gain = 1.0f;
+	}
+	state->preview_was_on = b_preview_on;
+
+	while (frame < i_num_frames)
+	{
+		int switches = 0;
+
+		if (frame > 0)
+		{
+			brickwallIirPoll(state, exchange, sample_rate, reset_serial);
+			desired = desired_source();
+		}
+		while (brickwallStepSource(state, desired) && ++switches < 3)
+		{
+			desired = desired_source();
+		}
+
+		frame += brickwallRunSegment(state, (state->source == BRICKWALL_SOURCE_FIR) ? *spp_engine : NULL,
+			&fp_buffer[(size_t)frame * (size_t)i_num_channels], i_num_frames - frame, i_num_channels,
+			processed_channels, b_preview_on);
+	}
 }
 
 /*
@@ -1143,190 +1804,74 @@ void DfxDspPrivate::adoptPendingBrickwallFirEngine()
 	brickwall_fir_active_latency_ms_ = 1000.0 * (double)filtPartConvGetLatencySamples(next) / (double)next->tag;
 }
 
-void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_sets)
+/*
+ * FUNCTION: DfxDspPrivate::brickwallDesiredSource()
+ * DESCRIPTION:
+ *   Audio thread: which source (BRICKWALL_SOURCE_*) the low cut filter's
+ *   output should be playing now. Dry when the filter or FxSound's power is
+ *   off, or when nothing matching the current format and reset serial is
+ *   ready yet. In Linear Phase mode a pending engine is adopted here, but
+ *   only while the current source isn't FIR - an engine is never retired
+ *   while it is still being played (or faded out). While an engine is
+ *   pending, the active one is not wanted any more: the current one fades
+ *   out, the new one is adopted while silent and faded in. Lock-free.
+ */
+int DfxDspPrivate::brickwallDesiredSource(bool filter_on, int processed_channels, unsigned int reset_serial)
 {
-	int sample_index;
-	int channel;
-
-	// Bypassed when the filter is off or FxSound's power is off (see powerOn()).
-	if (!brickwall_filter_on_ || !brickwall_power_on_)
+	if (!filter_on)
 	{
-		brickwall_iir_ran_last_buffer_ = false;
-		return;
-	}
-
-	// Read the atomic once per buffer; both paths use it. Each time the
-	// preview is switched on, its auto-leveller starts again from 0dB and rises
-	// to the listening level (see brickwallLevelPreviewFrame()).
-	bool preview_on = brickwall_filter_preview_on_;
-	if (preview_on && !brickwall_preview_was_on_)
-	{
-		brickwall_preview_mean_square_ = 0.0f;
-		brickwall_preview_gain_ = 1.0f;
-	}
-	brickwall_preview_was_on_ = preview_on;
-	// The leveller's coefficients only depend on the sample rate.
-	if (brickwall_preview_level_coeffs_rate_ != brickwall_cached_sample_rate_)
-	{
-		brickwall_preview_level_coeffs_ = brickwallPreviewLevelCoeffs(brickwall_cached_sample_rate_);
-		brickwall_preview_level_coeffs_rate_ = brickwall_cached_sample_rate_;
+		return BRICKWALL_SOURCE_DRY;
 	}
 
 	if (brickwall_linear_phase_on_)
 	{
-		// The Zero Latency path isn't fed while linear phase is on, so its
-		// history is stale when it next runs (see brickwallIirNeedsReset()).
-		brickwall_iir_ran_last_buffer_ = false;
-
-		// Linear-phase path: FFT partitioned convolution. Engines are built on
-		// the designer thread; this thread only adopts a finished one. Until an
-		// engine matching the current format is ready, audio passes through
-		// unfiltered. An engine stamped with an older reset serial holds history
-		// from before filtering last resumed, so it also passes audio through
-		// until its fresh replacement is adopted (see
-		// brickwall_fir_reset_serial_). filtPartConvProcessFrame() also returns
-		// the dry input delayed by the same latency, so the preview residual
-		// compares time-aligned samples.
-		adoptPendingBrickwallFirEngine();
+		if (brickwall_audio_.source != BRICKWALL_SOURCE_FIR)
+		{
+			adoptPendingBrickwallFirEngine();
+		}
 
 		// The engine must cover exactly the channels processed now: one built
-		// for fewer channels would delay only some of them.
+		// for fewer channels would delay only some of them. An engine stamped
+		// with an older reset serial holds history from before filtering last
+		// resumed (see brickwall_fir_reset_serial_).
 		FiltPartConv *engine = brickwall_fir_active_engine_;
-		int processed_channels = (brickwall_cached_num_channels_ < FILT_PART_CONV_MAX_CHANNELS) ?
-			brickwall_cached_num_channels_ : FILT_PART_CONV_MAX_CHANNELS;
-		if (engine == nullptr || engine->tag != brickwall_cached_sample_rate_ ||
-			engine->num_channels != processed_channels ||
-			engine->serial != brickwall_fir_reset_serial_.load(std::memory_order_acquire))
+		if (engine != nullptr && engine->tag == brickwall_cached_sample_rate_ &&
+			engine->num_channels == processed_channels && engine->serial == reset_serial &&
+			brickwall_fir_pending_engine_.load(std::memory_order_acquire) == nullptr)
 		{
-			return;
+			return BRICKWALL_SOURCE_FIR;
 		}
-
-		float dry[FILT_PART_CONV_MAX_CHANNELS];
-
-		for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
-		{
-			float *frame = &audio_buffer[sample_index * brickwall_cached_num_channels_];
-
-			filtPartConvProcessFrame(engine, frame, preview_on ? dry : NULL);
-
-			if (preview_on)
-			{
-				for (channel = 0; channel < engine->num_channels; channel++)
-				{
-					frame[channel] = dry[channel] - frame[channel];
-				}
-				brickwallLevelPreviewFrame(frame, engine->num_channels, &brickwall_preview_level_coeffs_,
-					&brickwall_preview_mean_square_, &brickwall_preview_gain_);
-			}
-		}
-
-		return;
+		return BRICKWALL_SOURCE_DRY;
 	}
 
-	{
-		// Zero Latency path. Adopt the newest parameter set the designer thread
-		// has published, if any (lock-free; see brickwallIirExchangeAdopt()).
-		// Until a set designed for the current sample rate and the current
-		// reset serial is ready, audio passes through unfiltered - the same
-		// rule as the linear-phase path.
-		const BrickwallIirParams *params = brickwallIirExchangeAdopt(&brickwall_iir_exchange_);
+	return brickwallIirReady(&brickwall_audio_, brickwall_cached_sample_rate_, reset_serial) ?
+		BRICKWALL_SOURCE_IIR : BRICKWALL_SOURCE_DRY;
+}
 
-		if (params->sample_rate != brickwall_cached_sample_rate_ ||
-			params->reset_serial != brickwall_fir_reset_serial_.load(std::memory_order_acquire))
-		{
-			brickwall_iir_ran_last_buffer_ = false;
-			return;
-		}
+/*
+ * FUNCTION: DfxDspPrivate::applyBrickwallFilter()
+ * DESCRIPTION:
+ *   Audio thread: applies the low cut filter to one buffer. All transitions
+ *   (filter/power on and off, Zero Latency <-> Linear Phase, latency mode,
+ *   cutoff, steepness, preview) are ramped - see the transition overview
+ *   above brickwallRampWeight() and brickwallProcessBuffer(). When the
+ *   filter is off and every fade has finished, this returns at once.
+ */
+void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_sets)
+{
+	const int num_channels = brickwall_cached_num_channels_;
+	const int processed_channels = (num_channels < FILT_PART_CONV_MAX_CHANNELS) ? num_channels : FILT_PART_CONV_MAX_CHANNELS;
+	// Read the switches before the reset serial: the UI thread bumps the
+	// serial before it turns them on (see brickwallFilterOn()).
+	const bool filter_on = brickwall_filter_on_ && brickwall_power_on_;
+	const bool preview_on = filter_on && brickwall_filter_preview_on_;
+	const unsigned int reset_serial = brickwall_fir_reset_serial_.load(std::memory_order_acquire);
 
-		int processed_channels = (brickwall_cached_num_channels_ < FILT_BRICKWALL_MAX_CHANNELS) ?
-			brickwall_cached_num_channels_ : FILT_BRICKWALL_MAX_CHANNELS;
-
-		// History is only ever reset here, on the audio thread, so it never
-		// races the cascade. A cutoff-only change keeps it (no click while
-		// dragging the cutoff slider).
-		if (brickwallIirNeedsReset(params, brickwall_iir_history_serial_, brickwall_iir_history_hp_sections_,
-			brickwall_iir_history_lp_sections_, brickwall_iir_ran_last_buffer_))
-		{
-			for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
-			{
-				filtBrickwallResetChannelState(&brickwall_channel_states_[channel]);
-			}
-			brickwall_iir_history_serial_ = params->reset_serial;
-			brickwall_iir_history_hp_sections_ = params->num_hp_sections;
-			brickwall_iir_history_lp_sections_ = params->num_lp_sections;
-		}
-		brickwall_iir_ran_last_buffer_ = true;
-
-		// The high-pass count is 0 when the user's low cutoff is 0Hz.
-		int num_hp_sections = params->num_hp_sections;
-		int num_lp_sections = params->num_lp_sections;
-
-		// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
-		// 1/4/8/11, but filtBrickwallProcessSample() does not itself bounds-check
-		// its section counts against FILT_BRICKWALL_MAX_SECTIONS before indexing
-		// into fixed-size arrays (the library code is generic and doesn't know
-		// about steepness policy). Clamp here, in the real-time audio path, as a
-		// safety net.
-		if (num_hp_sections > FILT_BRICKWALL_MAX_SECTIONS)
-		{
-			num_hp_sections = FILT_BRICKWALL_MAX_SECTIONS;
-		}
-		else if (num_hp_sections < 0)
-		{
-			num_hp_sections = 0;
-		}
-		if (num_lp_sections > FILT_BRICKWALL_MAX_SECTIONS)
-		{
-			num_lp_sections = FILT_BRICKWALL_MAX_SECTIONS;
-		}
-		else if (num_lp_sections < 0)
-		{
-			num_lp_sections = 0;
-		}
-
-		for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
-		{
-			for (channel = 0; channel < processed_channels; channel++)
-			{
-				int buffer_index = sample_index * brickwall_cached_num_channels_ + channel;
-				realtype pre_filter_sample = (realtype)audio_buffer[buffer_index];
-
-				// The high-pass (the filter) and the complementary low-pass (the
-				// preview, see brickwallDesignIirParams()) both run on every
-				// sample, using separate section histories, so toggling the
-				// preview never starts either one from stale history.
-				realtype filtered_sample = filtBrickwallProcessSample(
-					pre_filter_sample,
-					num_hp_sections,
-					0,
-					&params->hp_coeffs,
-					&params->lp_coeffs,
-					&brickwall_channel_states_[channel]);
-				realtype removed_sample = filtBrickwallProcessSample(
-					pre_filter_sample,
-					0,
-					num_lp_sections,
-					&params->hp_coeffs,
-					&params->lp_coeffs,
-					&brickwall_channel_states_[channel]);
-
-				if (preview_on)
-				{
-					audio_buffer[buffer_index] = (float)(num_lp_sections > 0 ? removed_sample : (realtype)0.0);
-				}
-				else
-				{
-					audio_buffer[buffer_index] = (float)filtered_sample;
-				}
-			}
-
-			if (preview_on)
-			{
-				brickwallLevelPreviewFrame(&audio_buffer[sample_index * brickwall_cached_num_channels_], processed_channels,
-					&brickwall_preview_level_coeffs_, &brickwall_preview_mean_square_, &brickwall_preview_gain_);
-			}
-		}
-	}
+	brickwallProcessBuffer(&brickwall_audio_, &brickwall_iir_exchange_, brickwall_cached_sample_rate_, reset_serial,
+		&brickwall_fir_active_engine_, audio_buffer, num_sample_sets, num_channels, preview_on,
+		[this, filter_on, processed_channels, reset_serial]() {
+			return brickwallDesiredSource(filter_on, processed_channels, reset_serial);
+		});
 }
 
 void DfxDspPrivate::brickwallFilterOn(bool on)

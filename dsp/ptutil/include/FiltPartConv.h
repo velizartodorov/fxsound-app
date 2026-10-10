@@ -45,7 +45,9 @@ struct FiltPartConvChannel {
  *
  * Filter swaps use a lock-free triple buffer of filter spectra: the audio
  * thread owns front_slot, the single publishing thread owns back_slot, and
- * middle_slot is exchanged atomically between them.
+ * middle_slot is exchanged atomically between them. A swap is crossfaded:
+ * the block in which a new filter is taken is computed with both filters and
+ * faded linearly from the old output to the new one over its B samples.
  */
 struct FiltPartConv {
 	int block_size;        /* B: partition size, also the added latency */

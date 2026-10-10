@@ -197,8 +197,8 @@ FiltPartConv PT_DECLSPEC *filtPartConvCreate(int i_block_size, int i_num_taps, i
  * FUNCTION: filtPartConvPublishFilter()
  * DESCRIPTION:
  *   Loads a new filter into the back slot and publishes it. The audio thread
- *   picks it up at its next block boundary; the input history (FDL) is kept,
- *   so audio continues without a gap. If the previous published filter was
+ *   picks it up at its next block boundary and crossfades to it over that
+ *   block; the input history (FDL) is kept, so audio continues without a gap. If the previous published filter was
  *   never picked up, it is simply replaced. Must always be called from the
  *   same single thread. Taps beyond the engine's capacity are ignored.
  */
@@ -226,31 +226,68 @@ int PT_DECLSPEC filtPartConvGetLatencySamples(const FiltPartConv *sp_conv)
 }
 
 /*
+ * FUNCTION: filtPartConvConvolveBlock()  [internal]
+ * DESCRIPTION:
+ *   For one channel whose newest input spectrum is already in its FDL:
+ *   multiply-accumulates the FDL against the P partitions of fp_filter
+ *   (partition p with the spectrum from p blocks ago), inverse FFT, and
+ *   returns a pointer to the block's B output samples (the last B of the
+ *   2B inverse transform: overlap-save) inside sp_conv->time_out. PFFFT's
+ *   inverse transform is unscaled, hence the 1/2B scaling. Audio thread only.
+ */
+static const float *filtPartConvConvolveBlock(FiltPartConv *sp_conv, FiltPartConvChannel *sp_chan, const float *fp_filter)
+{
+	const int fft_size = sp_conv->fft_size;
+	const int num_partitions = sp_conv->num_partitions;
+	const float scaling = 1.0f / (float)fft_size;
+	int partition;
+
+	memset(sp_conv->accum, 0, sizeof(float) * (size_t)fft_size);
+	for (partition = 0; partition < num_partitions; partition++)
+	{
+		int spectrum_index = sp_conv->fdl_head - partition;
+
+		if (spectrum_index < 0)
+		{
+			spectrum_index += num_partitions;
+		}
+
+		pffft_zconvolve_accumulate(sp_conv->fft_setup,
+			sp_chan->fdl + (size_t)spectrum_index * fft_size,
+			fp_filter + (size_t)partition * fft_size,
+			sp_conv->accum, scaling);
+	}
+
+	pffft_transform(sp_conv->fft_setup, sp_conv->accum, sp_conv->time_out, sp_conv->work, PFFFT_BACKWARD);
+	return sp_conv->time_out + sp_conv->block_size;
+}
+
+/*
  * FUNCTION: filtPartConvProcessBlock()  [internal]
  * DESCRIPTION:
- *   Runs once every B frames, on the audio thread. Takes a newly published
- *   filter if there is one; then for each channel: FFT of the last 2B input
- *   samples into the newest FDL entry, multiply-accumulate against the P
- *   filter partitions (partition p with the spectrum from p blocks ago),
- *   inverse FFT, and keep the last B samples (overlap-save). PFFFT's inverse
- *   transform is unscaled, hence the 1/2B scaling.
+ *   Runs once every B frames, on the audio thread. For each channel: FFT of
+ *   the last 2B input samples into the newest FDL entry, then the block's
+ *   output with the current (front) filter.
+ *
+ *   If a newly published filter is waiting, the block is then computed a
+ *   second time with it and the two outputs are crossfaded linearly across
+ *   the block's B samples (old -> new), so a filter swap never steps. The
+ *   order matters: every use of the current front slot comes first, and only
+ *   then is it handed back to the publisher (the exchange), so the audio
+ *   thread never reads a slot the publisher may already be overwriting. The
+ *   FDL holds input spectra, not filtered ones, so from the following block
+ *   on the output is exactly the new filter's. The swap costs one extra
+ *   accumulate + inverse FFT per channel, in that block only.
  */
 static void filtPartConvProcessBlock(FiltPartConv *sp_conv)
 {
 	const int block_size = sp_conv->block_size;
 	const int fft_size = sp_conv->fft_size;
-	const int num_partitions = sp_conv->num_partitions;
-	const float scaling = 1.0f / (float)fft_size;
-	const float *filter;
-	int channel, partition;
+	const float *filter = sp_conv->slots[sp_conv->front_slot];
+	const bool swap_pending = (sp_conv->middle_slot.load(std::memory_order_acquire) & FILT_PART_CONV_SLOT_DIRTY) != 0;
+	int channel, k;
 
-	if (sp_conv->middle_slot.load(std::memory_order_acquire) & FILT_PART_CONV_SLOT_DIRTY)
-	{
-		sp_conv->front_slot = sp_conv->middle_slot.exchange(sp_conv->front_slot, std::memory_order_acq_rel) & FILT_PART_CONV_SLOT_MASK;
-	}
-	filter = sp_conv->slots[sp_conv->front_slot];
-
-	sp_conv->fdl_head = (sp_conv->fdl_head + 1) % num_partitions;
+	sp_conv->fdl_head = (sp_conv->fdl_head + 1) % sp_conv->num_partitions;
 
 	for (channel = 0; channel < sp_conv->num_channels; channel++)
 	{
@@ -259,25 +296,30 @@ static void filtPartConvProcessBlock(FiltPartConv *sp_conv)
 		pffft_transform(sp_conv->fft_setup, chan->input_block,
 			chan->fdl + (size_t)sp_conv->fdl_head * fft_size, sp_conv->work, PFFFT_FORWARD);
 
-		memset(sp_conv->accum, 0, sizeof(float) * (size_t)fft_size);
-		for (partition = 0; partition < num_partitions; partition++)
-		{
-			int spectrum_index = sp_conv->fdl_head - partition;
-
-			if (spectrum_index < 0)
-			{
-				spectrum_index += num_partitions;
-			}
-
-			pffft_zconvolve_accumulate(sp_conv->fft_setup,
-				chan->fdl + (size_t)spectrum_index * fft_size,
-				filter + (size_t)partition * fft_size,
-				sp_conv->accum, scaling);
-		}
-
-		pffft_transform(sp_conv->fft_setup, sp_conv->accum, sp_conv->time_out, sp_conv->work, PFFFT_BACKWARD);
-		memcpy(chan->output_block, sp_conv->time_out + block_size, sizeof(float) * (size_t)block_size);
+		memcpy(chan->output_block, filtPartConvConvolveBlock(sp_conv, chan, filter), sizeof(float) * (size_t)block_size);
 		memmove(chan->input_block, chan->input_block + block_size, sizeof(float) * (size_t)block_size);
+	}
+
+	if (swap_pending)
+	{
+		const float step = 1.0f / (float)block_size;
+
+		/* The old front slot is not touched again after this exchange. */
+		sp_conv->front_slot = sp_conv->middle_slot.exchange(sp_conv->front_slot, std::memory_order_acq_rel) & FILT_PART_CONV_SLOT_MASK;
+		filter = sp_conv->slots[sp_conv->front_slot];
+
+		for (channel = 0; channel < sp_conv->num_channels; channel++)
+		{
+			FiltPartConvChannel *chan = &sp_conv->channels[channel];
+			const float *new_output = filtPartConvConvolveBlock(sp_conv, chan, filter);
+
+			for (k = 0; k < block_size; k++)
+			{
+				float weight = (float)(k + 1) * step;
+
+				chan->output_block[k] += weight * (new_output[k] - chan->output_block[k]);
+			}
+		}
 	}
 }
 
