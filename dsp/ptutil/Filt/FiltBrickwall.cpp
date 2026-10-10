@@ -41,22 +41,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *   at the design frequency itself, including at 20kHz/44.1kHz.
  *
  *   The resulting (gain, a1, a0) match this module's existing convention exactly
- *   (H(z) = gain*(1-2z^-1+z^-2)/(1-a1*z^-1-a0*z^-2), run via filtRun2ndHighPass())
- *   because the RBJ numerator (b0, b1, b2) = gain*(1, -2, 1) is already in that
- *   1:-2:1 ratio - only the coefficient VALUES differ from the old formula, not
- *   the difference-equation structure, so filtRun2ndHighPass()/LowPass() and
- *   filtPolyCalcBiquadPowerResponse() (used below) still apply unchanged.
+ *   (H(z) = gain*(1-2z^-1+z^-2)/(1-a1*z^-1-a0*z^-2), the same difference
+ *   equation as filtRun2ndHighPass()) because the RBJ numerator (b0, b1, b2) =
+ *   gain*(1, -2, 1) is already in that 1:-2:1 ratio. The coefficients are kept
+ *   in double precision and run by filtBrickwallRunSection() below.
  */
-void PT_DECLSPEC filtBrickwallDesignHighPass(realtype r_cutoff_hz, realtype r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs)
+void PT_DECLSPEC filtBrickwallDesignHighPass(double r_cutoff_hz, double r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs)
 {
-	double w0 = MTH_TWO_PI * (double)r_cutoff_hz / (double)r_sample_rate_hz;
+	double w0 = MTH_TWO_PI * r_cutoff_hz / r_sample_rate_hz;
 	double cos_w0 = cos(w0);
 	double alpha = sin(w0) / (2.0 * FILT_BRICKWALL_Q);
 	double a0_rbj = 1.0 + alpha;
 
-	cp_coeffs->gain = (realtype)((1.0 + cos_w0) / (2.0 * a0_rbj));
-	cp_coeffs->a1 = (realtype)((2.0 * cos_w0) / a0_rbj);
-	cp_coeffs->a0 = (realtype)((alpha - 1.0) / a0_rbj);
+	cp_coeffs->gain = (1.0 + cos_w0) / (2.0 * a0_rbj);
+	cp_coeffs->a1 = (2.0 * cos_w0) / a0_rbj;
+	cp_coeffs->a0 = (alpha - 1.0) / a0_rbj;
 }
 
 /*
@@ -64,16 +63,16 @@ void PT_DECLSPEC filtBrickwallDesignHighPass(realtype r_cutoff_hz, realtype r_sa
  * DESCRIPTION:
  *   Designs one 2nd-order Butterworth low-pass section. See filtBrickwallDesignHighPass().
  */
-void PT_DECLSPEC filtBrickwallDesignLowPass(realtype r_cutoff_hz, realtype r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs)
+void PT_DECLSPEC filtBrickwallDesignLowPass(double r_cutoff_hz, double r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs)
 {
-	double w0 = MTH_TWO_PI * (double)r_cutoff_hz / (double)r_sample_rate_hz;
+	double w0 = MTH_TWO_PI * r_cutoff_hz / r_sample_rate_hz;
 	double cos_w0 = cos(w0);
 	double alpha = sin(w0) / (2.0 * FILT_BRICKWALL_Q);
 	double a0_rbj = 1.0 + alpha;
 
-	cp_coeffs->gain = (realtype)((1.0 - cos_w0) / (2.0 * a0_rbj));
-	cp_coeffs->a1 = (realtype)((2.0 * cos_w0) / a0_rbj);
-	cp_coeffs->a0 = (realtype)((alpha - 1.0) / a0_rbj);
+	cp_coeffs->gain = (1.0 - cos_w0) / (2.0 * a0_rbj);
+	cp_coeffs->a1 = (2.0 * cos_w0) / a0_rbj;
+	cp_coeffs->a0 = (alpha - 1.0) / a0_rbj;
 }
 
 /*
@@ -89,16 +88,46 @@ void PT_DECLSPEC filtBrickwallResetChannelState(FiltBrickwallChannelState *sp_st
 
 	for (i = 0; i < FILT_BRICKWALL_MAX_SECTIONS; i++)
 	{
-		sp_state->hp_sections[i].in_minus1 = (realtype)0.0;
-		sp_state->hp_sections[i].in_minus2 = (realtype)0.0;
-		sp_state->hp_sections[i].out_minus1 = (realtype)0.0;
-		sp_state->hp_sections[i].out_minus2 = (realtype)0.0;
+		sp_state->hp_sections[i].in_minus1 = 0.0;
+		sp_state->hp_sections[i].in_minus2 = 0.0;
+		sp_state->hp_sections[i].out_minus1 = 0.0;
+		sp_state->hp_sections[i].out_minus2 = 0.0;
 
-		sp_state->lp_sections[i].in_minus1 = (realtype)0.0;
-		sp_state->lp_sections[i].in_minus2 = (realtype)0.0;
-		sp_state->lp_sections[i].out_minus1 = (realtype)0.0;
-		sp_state->lp_sections[i].out_minus2 = (realtype)0.0;
+		sp_state->lp_sections[i].in_minus1 = 0.0;
+		sp_state->lp_sections[i].in_minus2 = 0.0;
+		sp_state->lp_sections[i].out_minus1 = 0.0;
+		sp_state->lp_sections[i].out_minus2 = 0.0;
 	}
+}
+
+/*
+ * FUNCTION: filtBrickwallRunSection()  [internal]
+ * DESCRIPTION:
+ *   Runs one sample through one 2nd-order section, direct form I, in double
+ *   precision: y[n] = a1*y[n-1] + a0*y[n-2] + gain*(x[n] + d_mid*x[n-1] + x[n-2]),
+ *   with d_mid = -2 for a high-pass and +2 for a low-pass section (the same
+ *   difference equation as filtRun2ndHighPass()/LowPass() in FiltRun.cpp, which
+ *   run in realtype). Outputs this close to zero are flushed to exactly zero, so
+ *   history decaying in digital silence never lingers in the slow denormal range
+ *   (1e-30 is about -600dBFS, far below anything audible).
+ */
+static inline double filtBrickwallRunSection(double d_in, double d_mid, const FiltBrickwallBiquadCoeffs *cp_coeffs,
+	FiltBrickwallBiquadState *sp_section)
+{
+	double d_out = cp_coeffs->a1 * sp_section->out_minus1 + cp_coeffs->a0 * sp_section->out_minus2 +
+		cp_coeffs->gain * (d_in + d_mid * sp_section->in_minus1 + sp_section->in_minus2);
+
+	if (d_out < 1e-30 && d_out > -1e-30)
+	{
+		d_out = 0.0;
+	}
+
+	sp_section->in_minus2 = sp_section->in_minus1;
+	sp_section->in_minus1 = d_in;
+	sp_section->out_minus2 = sp_section->out_minus1;
+	sp_section->out_minus1 = d_out;
+
+	return d_out;
 }
 
 /*
@@ -106,67 +135,61 @@ void PT_DECLSPEC filtBrickwallResetChannelState(FiltBrickwallChannelState *sp_st
  * DESCRIPTION:
  *   Runs one sample through i_num_hp_sections identical cascaded high-pass
  *   sections followed by i_num_lp_sections identical cascaded low-pass sections,
- *   reusing the existing filtRun2ndHighPass()/filtRun2ndLowPass() biquad
- *   implementations (see FiltRun.cpp). Real-time safe: no allocation, no locking.
+ *   in double precision (see FiltBrickwallBiquadCoeffs). Real-time safe: no
+ *   allocation, no locking.
  */
 realtype PT_DECLSPEC filtBrickwallProcessSample(realtype r_input, int i_num_hp_sections, int i_num_lp_sections,
 	const FiltBrickwallBiquadCoeffs *cp_hp_coeffs, const FiltBrickwallBiquadCoeffs *cp_lp_coeffs,
 	FiltBrickwallChannelState *sp_state)
 {
-	realtype r_sample = r_input;
-	realtype r_out;
+	double d_sample = (double)r_input;
 	int i;
 
 	for (i = 0; i < i_num_hp_sections; i++)
 	{
-		filtRun2ndHighPass(r_sample,
-			&(sp_state->hp_sections[i].in_minus1), &(sp_state->hp_sections[i].in_minus2),
-			&r_out,
-			&(sp_state->hp_sections[i].out_minus1), &(sp_state->hp_sections[i].out_minus2),
-			cp_hp_coeffs->gain, cp_hp_coeffs->a1, cp_hp_coeffs->a0);
-		r_sample = r_out;
+		d_sample = filtBrickwallRunSection(d_sample, -2.0, cp_hp_coeffs, &(sp_state->hp_sections[i]));
 	}
 
 	for (i = 0; i < i_num_lp_sections; i++)
 	{
-		filtRun2ndLowPass(r_sample,
-			&(sp_state->lp_sections[i].in_minus1), &(sp_state->lp_sections[i].in_minus2),
-			&r_out,
-			&(sp_state->lp_sections[i].out_minus1), &(sp_state->lp_sections[i].out_minus2),
-			cp_lp_coeffs->gain, cp_lp_coeffs->a1, cp_lp_coeffs->a0);
-		r_sample = r_out;
+		d_sample = filtBrickwallRunSection(d_sample, 2.0, cp_lp_coeffs, &(sp_state->lp_sections[i]));
 	}
 
-	return r_sample;
+	return (realtype)d_sample;
 }
 
 /*
  * FUNCTION: filtBrickwallCalcBandResponseDb()  [internal]
  * DESCRIPTION:
  *   Evaluates one band's (high-pass or low-pass) cascaded magnitude response, in
- *   dB, at r_freq_hz. Reuses the existing filtPolyCalcBiquadPowerResponse() (see
- *   Filtpoly.cpp), which expects numerator/denominator coefficients in
- *   "b0*z^2+b1*z+b2 / a0*z^2+a1*z+a2" form and a normalized frequency
- *   (cycles/sample). filtRun2ndLowPass()/HighPass() implement
- *   y[n] = a1*y[n-1] + a0*y[n-2] + gain*(x[n] +/- 2x[n-1] + x[n-2]), i.e.
- *   H(z) = gain*(z^2 +/- 2z + 1) / (z^2 - a1*z - a0) after multiplying through by
- *   z^2 - hence the sign flips on a1/a0 below. Shared by filtBrickwallCalcResponseDb()
- *   and filtBrickwallCalibrateCascadeCutoff().
+ *   dB, at r_freq_hz, directly in double precision. For one section,
+ *   H(z) = gain*(1 +/- 2z^-1 + z^-2) / (1 - a1*z^-1 - a0*z^-2) (see
+ *   filtBrickwallRunSection()). The numerator is gain*(1 -/+ z^-1)^2, whose power
+ *   at w is gain^2*16*sin^4(w/2) (high-pass) or gain^2*16*cos^4(w/2) (low-pass) -
+ *   written that way to avoid the cancellation 1 - 2cos(w) + cos(2w) suffers at
+ *   the very low normalized frequencies of a 5-20Hz cutoff. Shared by
+ *   filtBrickwallCalcResponseDb() and filtBrickwallCalibrateCascadeCutoff().
  */
-static double filtBrickwallCalcBandResponseDb(realtype r_freq_hz, realtype r_sample_rate_hz, int i_num_sections,
+static double filtBrickwallCalcBandResponseDb(double r_freq_hz, double r_sample_rate_hz, int i_num_sections,
 	const FiltBrickwallBiquadCoeffs *cp_coeffs, int i_high_pass_flag)
 {
-	realtype r_norm_freq = r_freq_hz / r_sample_rate_hz;
-	realtype r_sign = i_high_pass_flag ? (realtype)-2.0 : (realtype)2.0;
-	realtype power;
+	double w = MTH_TWO_PI * r_freq_hz / r_sample_rate_hz;
+	double half = i_high_pass_flag ? sin(w / 2.0) : cos(w / 2.0);
+	double half_sq = half * half;
+	double num_power = 16.0 * half_sq * half_sq * cp_coeffs->gain * cp_coeffs->gain;
+	double den_re = 1.0 - cp_coeffs->a1 * cos(w) - cp_coeffs->a0 * cos(2.0 * w);
+	double den_im = cp_coeffs->a1 * sin(w) + cp_coeffs->a0 * sin(2.0 * w);
+	double den_power = den_re * den_re + den_im * den_im;
+	double power;
 	double total_power;
 
-	power = filtPolyCalcBiquadPowerResponse(
-		cp_coeffs->gain, r_sign * cp_coeffs->gain, cp_coeffs->gain,
-		(realtype)1.0, -(cp_coeffs->a1), -(cp_coeffs->a0),
-		r_norm_freq);
+	if (i_num_sections <= 0)
+	{
+		return 0.0;
+	}
 
-	total_power = pow((double)power, i_num_sections);
+	power = (den_power > 0.0) ? num_power / den_power : 0.0;
+	total_power = pow(power, i_num_sections);
 	if (total_power < 1e-18)
 	{
 		total_power = 1e-18;
@@ -181,7 +204,7 @@ static double filtBrickwallCalcBandResponseDb(realtype r_freq_hz, realtype r_sam
  *   Evaluates the combined (high-pass + low-pass cascade) magnitude response, in
  *   dB, at r_freq_hz, for verification/testing.
  */
-double PT_DECLSPEC filtBrickwallCalcResponseDb(realtype r_freq_hz, realtype r_sample_rate_hz, int i_num_hp_sections, int i_num_lp_sections,
+double PT_DECLSPEC filtBrickwallCalcResponseDb(double r_freq_hz, double r_sample_rate_hz, int i_num_hp_sections, int i_num_lp_sections,
 	const FiltBrickwallBiquadCoeffs *cp_hp_coeffs, const FiltBrickwallBiquadCoeffs *cp_lp_coeffs)
 {
 	double hp_db = filtBrickwallCalcBandResponseDb(r_freq_hz, r_sample_rate_hz, i_num_hp_sections, cp_hp_coeffs, 1);
@@ -213,21 +236,21 @@ double PT_DECLSPEC filtBrickwallCalcResponseDb(realtype r_freq_hz, realtype r_sa
  *   Control-thread only: ~60 iterations of trig-heavy evaluation per call. Never
  *   call this from the real-time audio path.
  */
-double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(realtype r_target_cutoff_hz, realtype r_sample_rate_hz, int i_num_sections, int i_high_pass_flag)
+double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(double r_target_cutoff_hz, double r_sample_rate_hz, int i_num_sections, int i_high_pass_flag)
 {
 	double lo, hi, nyquist;
 	int iteration;
 
-	nyquist = (double)r_sample_rate_hz / 2.0;
+	nyquist = r_sample_rate_hz / 2.0;
 
 	if (i_high_pass_flag)
 	{
 		lo = 0.01;
-		hi = (double)r_target_cutoff_hz;
+		hi = r_target_cutoff_hz;
 	}
 	else
 	{
-		lo = (double)r_target_cutoff_hz;
+		lo = r_target_cutoff_hz;
 		hi = nyquist * 0.999;
 	}
 
@@ -239,11 +262,11 @@ double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(realtype r_target_cutoff_
 
 		if (i_high_pass_flag)
 		{
-			filtBrickwallDesignHighPass((realtype)mid, r_sample_rate_hz, &coeffs);
+			filtBrickwallDesignHighPass(mid, r_sample_rate_hz, &coeffs);
 		}
 		else
 		{
-			filtBrickwallDesignLowPass((realtype)mid, r_sample_rate_hz, &coeffs);
+			filtBrickwallDesignLowPass(mid, r_sample_rate_hz, &coeffs);
 		}
 
 		response_db = filtBrickwallCalcBandResponseDb(r_target_cutoff_hz, r_sample_rate_hz, i_num_sections, &coeffs, i_high_pass_flag);

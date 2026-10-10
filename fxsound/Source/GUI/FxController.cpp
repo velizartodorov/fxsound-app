@@ -760,7 +760,17 @@ void FxController::init(FxMainWindow* main_window, FxSystemTrayView* system_tray
 		}
 
 		setBrickwallFilterSteepness(static_cast<DfxDsp::BrickwallSteepness>(settings_.getInt("brickwall_filter_steepness", static_cast<int>(DfxDsp::BrickwallSteepness::Standard))));
-		setBrickwallFilterLinearPhaseLatency(static_cast<DfxDsp::BrickwallLinearPhaseLatency>(settings_.getInt("brickwall_filter_linear_phase_latency", static_cast<int>(DfxDsp::BrickwallLinearPhaseLatency::Low))));
+		// Medium is the default latency: Low (20ms) can only make a soft cut at
+		// a 20Hz cutoff. Users who already had Linear Phase on before the
+		// latency setting existed keep the 20ms they were used to (a missing
+		// key reads back as the -1 sentinel).
+		int linear_phase_latency = settings_.getInt("brickwall_filter_linear_phase_latency", -1);
+		if (linear_phase_latency < 0)
+		{
+			linear_phase_latency = settings_.getBool("brickwall_filter_linear_phase_on") ?
+				static_cast<int>(DfxDsp::BrickwallLinearPhaseLatency::Low) : static_cast<int>(DfxDsp::BrickwallLinearPhaseLatency::Medium);
+		}
+		setBrickwallFilterLinearPhaseLatency(static_cast<DfxDsp::BrickwallLinearPhaseLatency>(linear_phase_latency));
 		setBrickwallFilterLinearPhaseOn(settings_.getBool("brickwall_filter_linear_phase_on"));
 		setBrickwallFilterHighPassCutoff(settings_.getInt("brickwall_filter_hp_cutoff_hz", DEFAULT_BRICKWALL_HP_CUTOFF_HZ));
 		setBrickwallFilterOn(settings_.getBool("brickwall_filter_on"));
@@ -2667,7 +2677,8 @@ DfxDsp::BrickwallSteepness FxController::getBrickwallFilterSteepness()
 void FxController::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
 {
 	dfx_dsp_.setBrickwallFilterSteepness(steepness);
-	settings_.setInt("brickwall_filter_steepness", static_cast<int>(steepness));
+	// Persist the value the DSP actually uses (it clamps out-of-range values).
+	settings_.setInt("brickwall_filter_steepness", static_cast<int>(dfx_dsp_.getBrickwallFilterSteepness()));
 }
 
 bool FxController::isBrickwallFilterPreviewOn()

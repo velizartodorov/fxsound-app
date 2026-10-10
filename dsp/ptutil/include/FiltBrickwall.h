@@ -28,19 +28,25 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
  * filtBrickwallDesignHighPass()/filtBrickwallDesignLowPass() below (a bilinear-
  * transform "RBJ cookbook" design - see FiltBrickwall.cpp for why the codebase's
  * existing filtDesign2ndButLowPass()/HighPass() in Fil12But.cpp are not used here:
- * they are inaccurate close to Nyquist, which a 20kHz cutoff always is at 44.1/48kHz). */
+ * they are inaccurate close to Nyquist, which a 20kHz cutoff always is at 44.1/48kHz).
+ * Double precision: at a low cutoff and a high sample rate (e.g. 5Hz at 96kHz) the
+ * poles sit very close to z = 1, where float32 coefficients and history lose
+ * precision: the cascade's actual response drifts from its design (the float32
+ * self-check needed a 1.5dB tolerance at the cutoff) and roundoff noise grows.
+ * Samples in and out stay realtype. */
 struct FiltBrickwallBiquadCoeffs {
-	realtype gain;
-	realtype a1;
-	realtype a0;
+	double gain;
+	double a1;
+	double a0;
 };
 
-/* Running state (sample history) for one 2nd-order section. */
+/* Running state (sample history) for one 2nd-order section, in double precision
+ * (see FiltBrickwallBiquadCoeffs). */
 struct FiltBrickwallBiquadState {
-	realtype in_minus1;
-	realtype in_minus2;
-	realtype out_minus1;
-	realtype out_minus2;
+	double in_minus1;
+	double in_minus2;
+	double out_minus1;
+	double out_minus2;
 };
 
 /* Per-channel state for a full high-pass + low-pass cascade. All sections in a
@@ -51,8 +57,8 @@ struct FiltBrickwallChannelState {
 	FiltBrickwallBiquadState lp_sections[FILT_BRICKWALL_MAX_SECTIONS];
 };
 
-void PT_DECLSPEC filtBrickwallDesignHighPass(realtype r_cutoff_hz, realtype r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs);
-void PT_DECLSPEC filtBrickwallDesignLowPass(realtype r_cutoff_hz, realtype r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs);
+void PT_DECLSPEC filtBrickwallDesignHighPass(double r_cutoff_hz, double r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs);
+void PT_DECLSPEC filtBrickwallDesignLowPass(double r_cutoff_hz, double r_sample_rate_hz, FiltBrickwallBiquadCoeffs *cp_coeffs);
 void PT_DECLSPEC filtBrickwallResetChannelState(FiltBrickwallChannelState *sp_state);
 /* The high-pass and low-pass bands take separate section counts so the high-pass
  * band can be bypassed entirely (i_num_hp_sections = 0) when the user sets the
@@ -61,7 +67,7 @@ void PT_DECLSPEC filtBrickwallResetChannelState(FiltBrickwallChannelState *sp_st
 realtype PT_DECLSPEC filtBrickwallProcessSample(realtype r_input, int i_num_hp_sections, int i_num_lp_sections,
 	const FiltBrickwallBiquadCoeffs *cp_hp_coeffs, const FiltBrickwallBiquadCoeffs *cp_lp_coeffs,
 	FiltBrickwallChannelState *sp_state);
-double PT_DECLSPEC filtBrickwallCalcResponseDb(realtype r_freq_hz, realtype r_sample_rate_hz, int i_num_hp_sections, int i_num_lp_sections,
+double PT_DECLSPEC filtBrickwallCalcResponseDb(double r_freq_hz, double r_sample_rate_hz, int i_num_hp_sections, int i_num_lp_sections,
 	const FiltBrickwallBiquadCoeffs *cp_hp_coeffs, const FiltBrickwallBiquadCoeffs *cp_lp_coeffs);
 
 /*
@@ -75,6 +81,6 @@ double PT_DECLSPEC filtBrickwallCalcResponseDb(realtype r_freq_hz, realtype r_sa
  * nonzero for the high-pass band, zero for the low-pass band. Control-thread
  * only - never call this from the real-time audio path.
  */
-double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(realtype r_target_cutoff_hz, realtype r_sample_rate_hz, int i_num_sections, int i_high_pass_flag);
+double PT_DECLSPEC filtBrickwallCalibrateCascadeCutoff(double r_target_cutoff_hz, double r_sample_rate_hz, int i_num_sections, int i_high_pass_flag);
 
 #endif

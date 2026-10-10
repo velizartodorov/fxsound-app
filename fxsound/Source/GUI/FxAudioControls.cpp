@@ -653,7 +653,7 @@ namespace
 		switch (position)
 		{
 		case DfxDsp::BrickwallLinearPhaseLatency::Low:
-			return TRANS("Low (20 ms): smallest delay, but a soft cut (about -6dB at 10Hz with a 20Hz cutoff).") + "\n" + meaning;
+			return TRANS("Low (20 ms): smallest delay, but a soft cut (about -6dB at 10Hz with a 20Hz cutoff) that also slightly reduces bass just above the cutoff (about -2dB at 40Hz).") + "\n" + meaning;
 		case DfxDsp::BrickwallLinearPhaseLatency::Medium:
 			return TRANS("Medium (160 ms): steep cut (about 80 dB/octave at a 20Hz cutoff).") + "\n" + meaning;
 		case DfxDsp::BrickwallLinearPhaseLatency::High:
@@ -915,7 +915,8 @@ void FxBrickwallControl::updateLabels()
 
 	// The cutoff's value is shown next to the slider's thumb (FxAudioSlider).
 	hp_cutoff_title_.setText(TRANS("Cutoff Frequency"), NotificationType::dontSendNotification);
-	hp_cutoff_slider_.setTooltip(TRANS("Frequencies below this are removed. Set to 0Hz to pass audio through unfiltered."));
+	hp_cutoff_slider_.setTooltip(TRANS("Frequencies below this are removed. Set to 0Hz to pass audio through unfiltered.") + "\n" +
+		TRANS("At the cutoff itself, Zero Latency is -3dB and Linear Phase is -6dB (Low latency cuts more softly)."));
 	filter_toggle_.setTooltip(brickwallToggleTooltip(hp_cutoff_hz));
 
 	warning_label_.setText(TRANS("Adds") + " ~" + String(brickwallLatencyMs(position)) + "ms " + TRANS("latency and higher CPU load"), NotificationType::dontSendNotification);
@@ -945,7 +946,7 @@ void FxBrickwallControl::restoreDefaults()
 	controller.setBrickwallFilterPreviewOn(false);
 	controller.setBrickwallFilterLinearPhaseOn(false);
 	controller.setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness::Standard);
-	controller.setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinearPhaseLatency::Low);
+	controller.setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinearPhaseLatency::Medium);
 	controller.setBrickwallFilterHighPassCutoff(FxController::DEFAULT_BRICKWALL_HP_CUTOFF_HZ);
 
 	update();

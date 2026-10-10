@@ -22,6 +22,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <string>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include "AudioPassthru.h"
 #include "codedefs.h"
 #include "DfxDsp.h"
@@ -80,6 +82,42 @@ public:
 	PT_HANDLE *hp_dfxg;
 };
 
+/* One-pole smoothing coefficients for the preview auto-leveller at a sample
+ * rate (see brickwallPreviewLevelCoeffs() in DfxDspPrivate.cpp). */
+struct BrickwallPreviewLevelCoeffs {
+	float rms;
+	float rise;
+	float fall;
+};
+
+/* An immutable Zero Latency (IIR) parameter set, designed on the designer
+ * thread for one sample rate / steepness / cutoff and published to the audio
+ * thread through BrickwallIirExchange. */
+struct BrickwallIirParams {
+	FiltBrickwallBiquadCoeffs hp_coeffs;
+	FiltBrickwallBiquadCoeffs lp_coeffs;  /* complementary low-pass, for the preview only */
+	int num_hp_sections;                  /* 0 when the cutoff is 0Hz (high-pass band bypassed) */
+	int num_lp_sections;
+	int sample_rate;                      /* 0 = no set designed yet */
+	unsigned int reset_serial;            /* brickwall_fir_reset_serial_ when it was designed */
+};
+
+#define BRICKWALL_IIR_NUM_SLOTS   3
+/* Set in middle_slot when it holds a set the audio thread hasn't taken yet. */
+#define BRICKWALL_IIR_SLOT_DIRTY  0x4
+#define BRICKWALL_IIR_SLOT_MASK   0x3
+
+/* Lock-free triple buffer of IIR parameter sets (the same scheme as
+ * FiltPartConv's filter spectra): the audio thread owns front_slot, the
+ * designer thread (the only publisher) owns back_slot, and middle_slot is
+ * exchanged atomically between them. */
+struct BrickwallIirExchange {
+	BrickwallIirParams slots[BRICKWALL_IIR_NUM_SLOTS];
+	int front_slot;                       /* audio thread only */
+	int back_slot;                        /* designer thread only */
+	std::atomic<int> middle_slot;
+};
+
 class DfxDspPrivate
 {
 public:
@@ -132,7 +170,8 @@ public:
 	void resetTotalAudioProcessedTime();
     void getSpectrumBandValues(float* rp_band_values, int i_array_size);
 
-	bool being_destroyed_ = false;
+	// Read by DfxDsp::processAudio()/setSignalFormat() on the audio thread.
+	std::atomic<bool> being_destroyed_{ false };
 private:
 	void processTimer();
 	int eqUpdateFromRegistry(int *ip_eq_changed);
@@ -150,14 +189,15 @@ private:
 	int eqSetProcessingOn(int i_storage_type, int i_on);
 	int eqGetProcessingOn(int i_storage_type, int *ip_on);
 
-	// Brickwall filter (dsp/ptutil/include/FiltBrickwall.h)
-	void updateBrickwallFilterCoefficients();
-	void resetBrickwallFilterState();
+	// Brickwall filter (dsp/ptutil/include/FiltBrickwall.h). Zero Latency
+	// (IIR) parameter sets are designed on the designer thread and adopted by
+	// the audio thread in applyBrickwallFilter().
 	void applyBrickwallFilter(float *audio_buffer, int num_sample_sets);
 
 	// Brickwall filter, linear-phase mode: FFT partitioned convolution
 	// (dsp/ptutil/include/FiltPartConv.h), designed on a background thread.
-	void requestBrickwallFirDesign();
+	// wake_designer must be false on the audio thread (no system calls there).
+	void requestBrickwallDesign(bool wake_designer);
 	void brickwallDesignerThreadMain();
 	void adoptPendingBrickwallFirEngine();
 
@@ -197,21 +237,33 @@ private:
 	float brickwall_preview_mean_square_ = 0.0f;
 	float brickwall_preview_gain_ = 1.0f;
 	bool brickwall_preview_was_on_ = false;
-	DfxDsp::BrickwallSteepness brickwall_filter_steepness_ = DfxDsp::BrickwallSteepness::Standard;
-	std::atomic<float> brickwall_hp_cutoff_hz_{ 20.0f }; // 0 = high-pass band bypassed; read by the designer thread
-	int brickwall_num_hp_sections_ = 0;
-	int brickwall_num_lp_sections_ = 0;
+	BrickwallPreviewLevelCoeffs brickwall_preview_level_coeffs_ = {};
+	int brickwall_preview_level_coeffs_rate_ = -1; // sample rate the coefficients above are for; -1 = not computed (audio thread only)
+	// Settings written by the UI thread and read by the designer thread.
+	std::atomic<int> brickwall_filter_steepness_{ DfxDsp::BrickwallSteepness::Standard };
+	std::atomic<float> brickwall_hp_cutoff_hz_{ 20.0f }; // 0 = high-pass band bypassed
+	// The current signal format: audio thread only (setSignalFormat() and
+	// applyBrickwallFilter()), apart from initialisation in the constructor.
 	int brickwall_cached_sample_rate_ = 44100;
 	int brickwall_cached_num_channels_ = 2;
-	FiltBrickwallBiquadCoeffs brickwall_hp_coeffs_;
-	FiltBrickwallBiquadCoeffs brickwall_lp_coeffs_ = {}; // complementary low-pass for the preview only (the filter is a low cut)
+
+	// Zero Latency (IIR) hand-off: the designer thread publishes immutable
+	// parameter sets into brickwall_iir_exchange_; the audio thread adopts the
+	// newest one at the start of each buffer. Everything below the exchange is
+	// audio thread only, so the cascade's history is only ever reset there.
+	BrickwallIirExchange brickwall_iir_exchange_;
 	FiltBrickwallChannelState brickwall_channel_states_[FILT_BRICKWALL_MAX_CHANNELS];
+	unsigned int brickwall_iir_history_serial_ = 0; // reset_serial of the set the history was last reset for
+	int brickwall_iir_history_hp_sections_ = -1;    // section counts the history belongs to
+	int brickwall_iir_history_lp_sections_ = -1;
+	bool brickwall_iir_ran_last_buffer_ = false;    // false whenever the IIR path skipped a buffer
 
 	// Linear-phase engine hand-off. The UI and audio threads only store and
 	// exchange these atomics; brickwall_designer_thread_ does all design and
-	// allocation. pending: designer -> audio. retired: audio -> designer
-	// (holds at most one engine; the audio thread adopts only when it is
-	// empty, so nothing is leaked).
+	// allocation (IIR parameter sets as well as linear-phase engines; the
+	// request generation and reset serial below drive both). pending:
+	// designer -> audio. retired: audio -> designer (holds at most one engine;
+	// the audio thread adopts only when it is empty, so nothing is leaked).
 	std::atomic<bool> brickwall_linear_phase_on_{ false };
 	std::atomic<int> brickwall_fir_latency_mode_{ DfxDsp::BrickwallLinearPhaseLatency::Low };
 	std::atomic<int> brickwall_fir_request_sample_rate_{ 44100 };
@@ -230,6 +282,11 @@ private:
 	FiltPartConv *brickwall_fir_active_engine_ = nullptr; // audio thread only
 	std::atomic<double> brickwall_fir_active_latency_ms_{ 0.0 };
 	std::atomic<bool> brickwall_designer_stop_{ false };
+	// The designer sleeps on brickwall_designer_wake_ (with a timeout, so
+	// requests made on the audio thread, which never notifies, are still
+	// picked up). UI-thread requests and the destructor notify it.
+	std::mutex brickwall_designer_mutex_;
+	std::condition_variable brickwall_designer_wake_;
 	std::thread brickwall_designer_thread_;
 };
 

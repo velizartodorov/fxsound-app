@@ -73,13 +73,9 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define DFXG_BRICKWALL_PREVIEW_FALL_MS      10.0    // ...and falls fast, so it never blasts
 #define DFXG_BRICKWALL_PREVIEW_LIMIT        0.9f    // soft limiter knee; output never exceeds 1.0
 
-/* One-pole smoothing coefficients for the preview leveller at a sample rate. */
-struct BrickwallPreviewLevelCoeffs {
-	float rms;
-	float rise;
-	float fall;
-};
-
+/* One-pole smoothing coefficients for the preview leveller at a sample rate
+ * (BrickwallPreviewLevelCoeffs is in u_DfxDsp.h). Not for the per-buffer path:
+ * applyBrickwallFilter() caches the result per sample rate. */
 static BrickwallPreviewLevelCoeffs brickwallPreviewLevelCoeffs(int sample_rate)
 {
 	BrickwallPreviewLevelCoeffs coeffs;
@@ -204,18 +200,134 @@ static int brickwallFirBlockSizeForMode(int mode)
 }
 
 /*
+ * FUNCTION: brickwallDesignIirParams()
+ * DESCRIPTION:
+ *   Designs a complete Zero Latency (IIR) parameter set. Designer thread (and
+ *   debug self-checks) only: the cutoff calibration is a numeric search, far
+ *   too slow for the audio thread.
+ *
+ *   The filter itself is a low cut only: a cascade of identical high-pass
+ *   sections, calibrated so the whole cascade is -3dB at the cutoff (cascading
+ *   shifts its -3dB point away from a single section's own cutoff, so the
+ *   design depends on the section count too). Its low-pass sections instead
+ *   produce the preview ("hear what's removed"): a complementary low-pass at
+ *   the same cutoff and steepness, also -3dB at the cutoff. Subtracting the
+ *   filtered signal from the input can't be used here, because this
+ *   minimum-phase cascade shifts the phase of content far above the cutoff
+ *   without changing its level, and that phase shift would leak into the
+ *   difference (about -16dB at 1kHz for Ultra Steep).
+ *
+ *   A 0Hz cutoff means "no low-frequency filtering": both bands get 0
+ *   sections instead of being designed, since a biquad high-pass at exactly
+ *   0Hz is degenerate (see FiltBrickwall.h), and with nothing removed the
+ *   preview is silent.
+ */
+static void brickwallDesignIirParams(int sample_rate, int steepness, float cutoff_hz, unsigned int reset_serial,
+	BrickwallIirParams *params)
+{
+	int num_sections = brickwallNumSectionsForSteepness(static_cast<DfxDsp::BrickwallSteepness>(steepness));
+	bool hp_bypassed = cutoff_hz <= 0.0f;
+
+	*params = {};
+	if (!hp_bypassed && sample_rate > 0)
+	{
+		double calibrated_hp_cutoff = filtBrickwallCalibrateCascadeCutoff((double)cutoff_hz, (double)sample_rate, num_sections, 1);
+		double calibrated_lp_cutoff = filtBrickwallCalibrateCascadeCutoff((double)cutoff_hz, (double)sample_rate, num_sections, 0);
+
+		filtBrickwallDesignHighPass(calibrated_hp_cutoff, (double)sample_rate, &params->hp_coeffs);
+		filtBrickwallDesignLowPass(calibrated_lp_cutoff, (double)sample_rate, &params->lp_coeffs);
+		params->num_hp_sections = num_sections;
+		params->num_lp_sections = num_sections;
+	}
+	params->sample_rate = sample_rate;
+	params->reset_serial = reset_serial;
+}
+
+/*
+ * FUNCTION: brickwallIirExchangeInit() / brickwallIirExchangePublish() /
+ *           brickwallIirExchangeAdopt()
+ * DESCRIPTION:
+ *   Lock-free triple buffer of IIR parameter sets (see BrickwallIirExchange in
+ *   u_DfxDsp.h). Publish: designer thread only (the single producer); it
+ *   fills its back slot, then swaps it into the middle with the dirty bit set
+ *   (release). Adopt: audio thread only (the single consumer); if the middle
+ *   is dirty it swaps its front slot in for it (acquire), and it always
+ *   returns the front slot, which nothing else writes while it is the front.
+ *   Atomic loads/exchanges only - real-time safe. Before the first publish the
+ *   front set has sample_rate 0, which never matches a real format.
+ */
+static void brickwallIirExchangeInit(BrickwallIirExchange *exchange)
+{
+	int slot;
+
+	for (slot = 0; slot < BRICKWALL_IIR_NUM_SLOTS; slot++)
+	{
+		exchange->slots[slot] = {};
+	}
+	exchange->front_slot = 0;
+	exchange->middle_slot.store(1, std::memory_order_relaxed);
+	exchange->back_slot = 2;
+}
+
+static void brickwallIirExchangePublish(BrickwallIirExchange *exchange, const BrickwallIirParams *params)
+{
+	exchange->slots[exchange->back_slot] = *params;
+	int previous = exchange->middle_slot.exchange(exchange->back_slot | BRICKWALL_IIR_SLOT_DIRTY, std::memory_order_acq_rel);
+	exchange->back_slot = previous & BRICKWALL_IIR_SLOT_MASK;
+}
+
+static const BrickwallIirParams *brickwallIirExchangeAdopt(BrickwallIirExchange *exchange)
+{
+	if (exchange->middle_slot.load(std::memory_order_relaxed) & BRICKWALL_IIR_SLOT_DIRTY)
+	{
+		int previous = exchange->middle_slot.exchange(exchange->front_slot, std::memory_order_acq_rel);
+		exchange->front_slot = previous & BRICKWALL_IIR_SLOT_MASK;
+	}
+
+	return &exchange->slots[exchange->front_slot];
+}
+
+/*
+ * FUNCTION: brickwallIirNeedsReset()
+ * DESCRIPTION:
+ *   Audio thread: whether the IIR cascade's history must be cleared before
+ *   running the parameter set *params. It must when the set belongs to a newer
+ *   reset serial (filter on, power on, format change), when the section counts
+ *   changed (steepness change, or a 0Hz cutoff bypass toggled), or when the
+ *   IIR path skipped the previous buffer (linear phase was on, the filter or
+ *   power was off, or no matching set was ready), since its history is then
+ *   stale. A cutoff-only change keeps the history, so dragging the cutoff
+ *   slider doesn't click.
+ */
+static bool brickwallIirNeedsReset(const BrickwallIirParams *params, unsigned int history_serial,
+	int history_hp_sections, int history_lp_sections, bool ran_last_buffer)
+{
+	return !ran_last_buffer ||
+		params->reset_serial != history_serial ||
+		params->num_hp_sections != history_hp_sections ||
+		params->num_lp_sections != history_lp_sections;
+}
+
+/*
  * FUNCTION: debugVerifyBrickwallFilterResponse()
  * DESCRIPTION:
  *   Debug-only runtime self-check of the brickwall filter's frequency response,
  *   in place of a unit test (this codebase has no test framework under dsp/).
  *   Asserts (fails loudly in Debug builds), for every (sample rate, steepness)
- *   combination, that:
+ *   combination of parameter sets from brickwallDesignIirParams(), that:
  *     - the passband (1kHz and 20kHz) is essentially untouched by the filter -
  *       it is a low cut only, with no high cut;
- *     - the cascade's actual response at the 20Hz target cutoff is within a
- *       tolerance of the intended -3.0103dB, confirming
- *       filtBrickwallCalibrateCascadeCutoff() (FiltBrickwall.cpp) is correctly
- *       compensating for the cascade-shift effect.
+ *     - the cascade's actual response at the 20Hz target cutoff is the
+ *       intended -3.0103dB, confirming filtBrickwallCalibrateCascadeCutoff()
+ *       (FiltBrickwall.cpp) correctly compensates for the cascade-shift effect;
+ *     - the preview's complementary low-pass is -3dB at the cutoff too, and
+ *       content well above the cutoff doesn't leak into "what's removed".
+ *   Then, in the time domain, that filtBrickwallProcessSample()'s double-
+ *   precision sections really implement the designed response: a 30Hz tone
+ *   through the 20Hz Standard cascade comes out of both bands at the level the
+ *   analytic response predicts, and at the hardest case for precision (5Hz
+ *   cutoff at 96kHz, Ultra Steep: poles closest to z = 1) a 1kHz tone passes
+ *   the high-pass at full level and stays out of the preview's low-pass.
  */
 static void debugVerifyBrickwallFilterResponse()
 {
@@ -235,46 +347,154 @@ static void debugVerifyBrickwallFilterResponse()
 		for (steepness_index = 0; steepness_index < sizeof(steepness_values) / sizeof(steepness_values[0]); steepness_index++)
 		{
 			int num_sections = brickwallNumSectionsForSteepness(steepness_values[steepness_index]);
+			BrickwallIirParams params;
 
-			double calibrated_hp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, 1);
+			brickwallDesignIirParams((int)sample_rate, steepness_values[steepness_index], (float)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, 7u, &params);
+			assert(params.num_hp_sections == num_sections && params.num_lp_sections == num_sections);
+			assert(params.sample_rate == (int)sample_rate && params.reset_serial == 7u);
 
-			// Low cut only: the cascade's low-pass band is never run (0 sections),
-			// so its coefficients are never read.
-			FiltBrickwallBiquadCoeffs hp_coeffs;
-			FiltBrickwallBiquadCoeffs unused_lp_coeffs = {};
-			filtBrickwallDesignHighPass((realtype)calibrated_hp_cutoff, (realtype)sample_rate, &hp_coeffs);
+			// Low cut only: the high-pass band alone (0 low-pass sections).
+			double passband_db = filtBrickwallCalcResponseDb(1000.0, sample_rate, num_sections, 0, &params.hp_coeffs, &params.lp_coeffs);
+			double top_of_band_db = filtBrickwallCalcResponseDb(20000.0, sample_rate, num_sections, 0, &params.hp_coeffs, &params.lp_coeffs);
+			double response_at_hp_target_db = filtBrickwallCalcResponseDb(DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, sample_rate, num_sections, 0, &params.hp_coeffs, &params.lp_coeffs);
 
-			double passband_db = filtBrickwallCalcResponseDb((realtype)1000.0, (realtype)sample_rate, num_sections, 0, &hp_coeffs, &unused_lp_coeffs);
-			double top_of_band_db = filtBrickwallCalcResponseDb((realtype)20000.0, (realtype)sample_rate, num_sections, 0, &hp_coeffs, &unused_lp_coeffs);
-			double response_at_hp_target_db = filtBrickwallCalcResponseDb((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, 0, &hp_coeffs, &unused_lp_coeffs);
-
-			// The high-pass target (20Hz) tolerance is wide: verified numerically
-			// (in double precision) that the calibration search itself is exact,
-			// but evaluating it through this module's realtype (32-bit float)
-			// coefficients and filtPolyCalcBiquadPowerResponse's float-precision
-			// trig math loses meaningful accuracy at such a low absolute frequency
-			// relative to these sample rates (observed up to ~0.9dB off in float32,
-			// worst case fs=96000/Steep) - inaudible at 10-20Hz, but a real float32
-			// precision limit, not a calibration bug. With no high cut, the top of
-			// the audible band must be untouched too.
+			// With double-precision coefficients and response evaluation, the
+			// calibration lands on -3.0103dB to well under 0.001dB (the float32
+			// version needed a 1.5dB tolerance here).
 			assert(passband_db > -0.1);
 			assert(top_of_band_db > -0.1);
-			assert(fabs(response_at_hp_target_db - (-3.0103)) < 1.5);
+			assert(fabs(response_at_hp_target_db - (-3.0103)) < 0.01);
 
-			// The preview's complementary low-pass (see
-			// updateBrickwallFilterCoefficients()): -3dB at the same cutoff, and
-			// content well above the cutoff must not leak into "what's removed".
-			double calibrated_lp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, num_sections, 0);
-			FiltBrickwallBiquadCoeffs preview_lp_coeffs;
-			filtBrickwallDesignLowPass((realtype)calibrated_lp_cutoff, (realtype)sample_rate, &preview_lp_coeffs);
+			// The preview's complementary low-pass band alone.
+			double preview_at_cutoff_db = filtBrickwallCalcResponseDb(DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, sample_rate, 0, num_sections, &params.hp_coeffs, &params.lp_coeffs);
+			double preview_at_1khz_db = filtBrickwallCalcResponseDb(1000.0, sample_rate, 0, num_sections, &params.hp_coeffs, &params.lp_coeffs);
 
-			double preview_at_cutoff_db = filtBrickwallCalcResponseDb((realtype)DFXG_BRICKWALL_HIGH_PASS_CUTOFF_HZ, (realtype)sample_rate, 0, num_sections, &hp_coeffs, &preview_lp_coeffs);
-			double preview_at_1khz_db = filtBrickwallCalcResponseDb((realtype)1000.0, (realtype)sample_rate, 0, num_sections, &hp_coeffs, &preview_lp_coeffs);
-
-			assert(fabs(preview_at_cutoff_db - (-3.0103)) < 1.5);
+			assert(fabs(preview_at_cutoff_db - (-3.0103)) < 0.01);
 			assert(preview_at_1khz_db < -60.0);
 		}
 	}
+
+	{
+		struct ToneCase {
+			int sample_rate;
+			DfxDsp::BrickwallSteepness steepness;
+			float cutoff_hz;
+			double tone_hz;
+		};
+		const ToneCase cases[] = {
+			{ 48000, DfxDsp::BrickwallSteepness::Standard, 20.0f, 30.0 },
+			{ 96000, DfxDsp::BrickwallSteepness::UltraSteep, 5.0f, 1000.0 }
+		};
+		size_t case_index;
+
+		for (case_index = 0; case_index < sizeof(cases) / sizeof(cases[0]); case_index++)
+		{
+			const ToneCase& tone = cases[case_index];
+			// 2s, measured over the last 0.5s (a whole number of cycles of both
+			// tones), once the filters' start-up transient has died away.
+			const int num_frames = 2 * tone.sample_rate;
+			const int measure_from = num_frames - tone.sample_rate / 2;
+			BrickwallIirParams params;
+			FiltBrickwallChannelState state;
+			double input_sum = 0.0, filtered_sum = 0.0, removed_sum = 0.0;
+			int n;
+
+			brickwallDesignIirParams(tone.sample_rate, tone.steepness, tone.cutoff_hz, 0u, &params);
+			filtBrickwallResetChannelState(&state);
+			for (n = 0; n < num_frames; n++)
+			{
+				const double two_pi = 6.283185307179586;
+				realtype input = (realtype)(0.5 * sin(two_pi * tone.tone_hz * (double)n / (double)tone.sample_rate));
+				realtype filtered = filtBrickwallProcessSample(input, params.num_hp_sections, 0, &params.hp_coeffs, &params.lp_coeffs, &state);
+				realtype removed = filtBrickwallProcessSample(input, 0, params.num_lp_sections, &params.hp_coeffs, &params.lp_coeffs, &state);
+
+				if (n >= measure_from)
+				{
+					input_sum += (double)input * (double)input;
+					filtered_sum += (double)filtered * (double)filtered;
+					removed_sum += (double)removed * (double)removed;
+				}
+			}
+
+			double filtered_db = 10.0 * log10(filtered_sum / input_sum);
+			double removed_db = 10.0 * log10((removed_sum + 1e-30) / input_sum);
+			double expected_filtered_db = filtBrickwallCalcResponseDb(tone.tone_hz, (double)tone.sample_rate,
+				params.num_hp_sections, 0, &params.hp_coeffs, &params.lp_coeffs);
+			double expected_removed_db = filtBrickwallCalcResponseDb(tone.tone_hz, (double)tone.sample_rate,
+				0, params.num_lp_sections, &params.hp_coeffs, &params.lp_coeffs);
+
+			assert(fabs(filtered_db - expected_filtered_db) < 0.05);
+			if (expected_removed_db > -40.0)
+			{
+				assert(fabs(removed_db - expected_removed_db) < 0.05);
+			}
+			else
+			{
+				assert(removed_db < -60.0);
+			}
+		}
+	}
+}
+
+/*
+ * FUNCTION: debugVerifyBrickwallIirHandoff()
+ * DESCRIPTION:
+ *   Debug-only self-check of the Zero Latency parameter hand-off: the
+ *   triple buffer always yields the newest published set (older unread ones
+ *   are skipped, and an adopt with nothing pending keeps the current set), and
+ *   brickwallIirNeedsReset() keeps the history for a cutoff-only change but
+ *   resets it for a steepness change, a new reset serial, or a skipped buffer.
+ *   Single-threaded: it checks the protocol's logic, not its memory ordering.
+ */
+static void debugVerifyBrickwallIirHandoff()
+{
+	BrickwallIirExchange exchange;
+	BrickwallIirParams first, cutoff_moved, steeper;
+	const BrickwallIirParams *adopted;
+
+	brickwallIirExchangeInit(&exchange);
+	adopted = brickwallIirExchangeAdopt(&exchange);
+	assert(adopted->sample_rate == 0); // nothing designed yet: audio passes through
+
+	brickwallDesignIirParams(48000, DfxDsp::BrickwallSteepness::Standard, 20.0f, 1u, &first);
+	brickwallDesignIirParams(48000, DfxDsp::BrickwallSteepness::Standard, 40.0f, 1u, &cutoff_moved);
+	brickwallDesignIirParams(48000, DfxDsp::BrickwallSteepness::UltraSteep, 40.0f, 1u, &steeper);
+
+	brickwallIirExchangePublish(&exchange, &first);
+	adopted = brickwallIirExchangeAdopt(&exchange);
+	assert(adopted->sample_rate == 48000 && adopted->num_hp_sections == first.num_hp_sections);
+	assert(adopted->hp_coeffs.a1 == first.hp_coeffs.a1);
+	// First use after nothing ran: reset.
+	assert(brickwallIirNeedsReset(adopted, 0u, -1, -1, false));
+
+	// Cutoff-only change: same serial and section counts, history kept.
+	brickwallIirExchangePublish(&exchange, &cutoff_moved);
+	adopted = brickwallIirExchangeAdopt(&exchange);
+	assert(adopted->hp_coeffs.a1 == cutoff_moved.hp_coeffs.a1);
+	assert(!brickwallIirNeedsReset(adopted, 1u, first.num_hp_sections, first.num_lp_sections, true));
+
+	// Nothing pending: the same set stays adopted.
+	assert(brickwallIirExchangeAdopt(&exchange) == adopted);
+
+	// Two publishes before an adopt: only the newest is seen. A steepness
+	// change resets the history.
+	brickwallIirExchangePublish(&exchange, &first);
+	brickwallIirExchangePublish(&exchange, &steeper);
+	adopted = brickwallIirExchangeAdopt(&exchange);
+	assert(adopted->num_hp_sections == steeper.num_hp_sections && adopted->hp_coeffs.a1 == steeper.hp_coeffs.a1);
+	assert(brickwallIirNeedsReset(adopted, 1u, cutoff_moved.num_hp_sections, cutoff_moved.num_lp_sections, true));
+
+	// A newer reset serial (filter/power on, format change) resets the history.
+	assert(brickwallIirNeedsReset(adopted, 0u, steeper.num_hp_sections, steeper.num_lp_sections, true));
+	// So does a buffer the IIR path skipped.
+	assert(brickwallIirNeedsReset(adopted, 1u, steeper.num_hp_sections, steeper.num_lp_sections, false));
+	assert(!brickwallIirNeedsReset(adopted, 1u, steeper.num_hp_sections, steeper.num_lp_sections, true));
+
+	// A 0Hz cutoff designs no sections, and re-enabling the band resets.
+	BrickwallIirParams bypassed;
+	brickwallDesignIirParams(48000, DfxDsp::BrickwallSteepness::Standard, 0.0f, 1u, &bypassed);
+	assert(bypassed.num_hp_sections == 0 && bypassed.num_lp_sections == 0 && bypassed.sample_rate == 48000);
+	assert(brickwallIirNeedsReset(&first, 1u, bypassed.num_hp_sections, bypassed.num_lp_sections, true));
 }
 
 /*
@@ -284,7 +504,8 @@ static void debugVerifyBrickwallFilterResponse()
  *   latency mode at 44.1/48/96kHz: odd tap count, a flat passband all the way
  *   up to 20kHz (there is no high cut), and a steep low edge in the longer
  *   modes. Low's passband is checked from 200Hz because its ~185Hz-wide
- *   transition band, centred on the 20Hz cutoff, reaches ~115Hz.
+ *   transition band, centred on the 20Hz cutoff, reaches ~115Hz; Low gets its
+ *   own honest bounds instead (see below).
  */
 static void debugVerifyBrickwallKaiserResponse()
 {
@@ -326,6 +547,21 @@ static void debugVerifyBrickwallKaiserResponse()
 			else if (mode == DfxDsp::BrickwallLinearPhaseLatency::Medium)
 			{
 				assert(at_half_cutoff_db < -60.0);
+			}
+			else
+			{
+				// Low (20ms) can't cut steeply this low: its transition band is
+				// far wider than the cutoff (physics, not a design flaw). Honest
+				// bounds at the 20Hz default, matching its tooltip: a soft cut
+				// (about -5.6 to -6.2dB at 10Hz), a slight bass loss just above
+				// the cutoff (about -2.2 to -2.3dB at 40Hz), and an untouched
+				// midrange.
+				double at_40hz_db = filtBrickwallFirCalcResponseDb((realtype)40.0, (realtype)sample_rate, coeffs.data(), num_taps);
+				double at_1khz_db = filtBrickwallFirCalcResponseDb((realtype)1000.0, (realtype)sample_rate, coeffs.data(), num_taps);
+
+				assert(at_half_cutoff_db < -5.0);
+				assert(at_40hz_db < -1.5 && at_40hz_db > -3.0);
+				assert(fabs(at_1khz_db) < 0.1);
 			}
 		}
 	}
@@ -594,17 +830,35 @@ DfxDspPrivate::DfxDspPrivate()
 	{
 	}
 
+	// No IIR parameter set exists until the designer thread publishes its
+	// first one (it designs as soon as it starts), so until then the Zero
+	// Latency path passes audio through.
 	brickwall_cached_sample_rate_ = 44100;
 	brickwall_cached_num_channels_ = 2;
-	updateBrickwallFilterCoefficients();
-	resetBrickwallFilterState();
+	brickwallIirExchangeInit(&brickwall_iir_exchange_);
+	for (int channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+	{
+		filtBrickwallResetChannelState(&brickwall_channel_states_[channel]);
+	}
 
 #ifdef _DEBUG
-	debugVerifyBrickwallFilterResponse();
-	debugVerifyBrickwallKaiserResponse();
-	debugVerifyPartConvEquivalence();
-	debugVerifyPartConvLatency();
-	debugVerifyBrickwallPreviewLeveller();
+	{
+		// Setting FXSOUND_SKIP_DSP_SELFCHECKS=1 skips the self-checks (they take
+		// a noticeable moment at every start of a Debug build). They run by
+		// default.
+		char skip_value[4] = {};
+		DWORD skip_length = GetEnvironmentVariableA("FXSOUND_SKIP_DSP_SELFCHECKS", skip_value, sizeof(skip_value));
+
+		if (!(skip_length == 1 && skip_value[0] == '1'))
+		{
+			debugVerifyBrickwallFilterResponse();
+			debugVerifyBrickwallIirHandoff();
+			debugVerifyBrickwallKaiserResponse();
+			debugVerifyPartConvEquivalence();
+			debugVerifyPartConvLatency();
+			debugVerifyBrickwallPreviewLeveller();
+		}
+	}
 #endif
 
 	// Started last, once every member it reads is initialised.
@@ -616,13 +870,21 @@ DfxDspPrivate::DfxDspPrivate()
 
 DfxDspPrivate::~DfxDspPrivate()
 {
-	// So the thread/timer will not attempt to use this object while it's being destroyed.
+	// The audio thread is expected to have been stopped by AudioPassthru
+	// before DfxDsp is destroyed. being_destroyed_ only narrows the window if
+	// it hasn't: DfxDsp::processAudio()/setSignalFormat() stop calling in once
+	// they see it, but a call already inside this object is not waited for, so
+	// this is no guarantee.
 	being_destroyed_ = true;
 
 	// Stop the designer before freeing engines it may still be building or
-	// publishing to. The audio thread no longer calls in once being_destroyed_
-	// is set (see DfxDsp::processAudio()).
-	brickwall_designer_stop_ = true;
+	// publishing to. The stop flag is set under the mutex, so the designer
+	// either sees it before waiting or is already waiting and is woken.
+	{
+		std::lock_guard<std::mutex> lock(brickwall_designer_mutex_);
+		brickwall_designer_stop_ = true;
+	}
+	brickwall_designer_wake_.notify_one();
 	if (brickwall_designer_thread_.joinable())
 	{
 		brickwall_designer_thread_.join();
@@ -707,89 +969,78 @@ int DfxDspPrivate::setSignalFormat(int i_bps, int i_nch, int i_srate, int i_vali
 	if (dfxpUniversalSetSignalFormat(dfxp_handle_, i_bps, i_nch, i_srate, i_valid_bits) != OKAY)
 		return(NOT_OKAY);
 
+	// Called on the audio thread before every buffer, so no filter design and
+	// no system calls here: only atomics. The designer thread picks the
+	// request up on its next timed wake (it is not notified from here).
 	if (i_srate != brickwall_cached_sample_rate_ || i_nch != brickwall_cached_num_channels_)
 	{
-		// The active linear-phase engine isn't fed in the new format, so its
-		// history must never play again, even if the format changes back
-		// (e.g. 44.1k -> 48k -> 44.1k before a 48k engine is adopted). Bumping
-		// the reset serial (lock-free) makes it fail the audio thread's serial
-		// check and forces the designer to build a new engine. Bumped before
-		// the design request below, as in brickwallFilterOn().
+		// Neither path's history is valid in the new format and must never
+		// play again, even if the format changes back (e.g. 44.1k -> 48k ->
+		// 44.1k before anything new is adopted). Bumping the reset serial
+		// (lock-free) makes the active linear-phase engine and IIR parameter
+		// set fail the audio thread's serial check - audio passes through
+		// until fresh ones are ready, and the IIR history is then reset - and
+		// forces the designer to build a new engine. Bumped before the design
+		// request below, as in brickwallFilterOn().
 		brickwall_fir_reset_serial_.fetch_add(1, std::memory_order_acq_rel);
 		brickwall_cached_sample_rate_ = i_srate;
 		brickwall_cached_num_channels_ = i_nch;
-		updateBrickwallFilterCoefficients();
-		resetBrickwallFilterState();
 		brickwall_fir_request_sample_rate_ = i_srate;
 		brickwall_fir_request_num_channels_ = (i_nch < FILT_PART_CONV_MAX_CHANNELS) ? i_nch : FILT_PART_CONV_MAX_CHANNELS;
-		requestBrickwallFirDesign();
+		requestBrickwallDesign(false);
 	}
 
 	return OKAY;
 }
 
-void DfxDspPrivate::updateBrickwallFilterCoefficients()
-{
-	// Coefficients depend on the current section count (cascading shifts the
-	// cascade's actual -3dB point away from a single section's own cutoff), so
-	// this must be recomputed whenever num_sections changes too, not just the
-	// sample rate - see setBrickwallFilterSteepness() below.
-	int num_sections = brickwallNumSectionsForSteepness(brickwall_filter_steepness_);
-	// A 0Hz high-pass cutoff means "no low-frequency filtering": the high-pass
-	// band is skipped instead of designed, since a biquad high-pass at exactly
-	// 0Hz is degenerate (see FiltBrickwall.h).
-	bool hp_bypassed = brickwall_hp_cutoff_hz_ <= 0.0f;
-
-	if (!hp_bypassed)
-	{
-		double calibrated_hp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)brickwall_hp_cutoff_hz_, (realtype)brickwall_cached_sample_rate_, num_sections, 1);
-		filtBrickwallDesignHighPass((realtype)calibrated_hp_cutoff, (realtype)brickwall_cached_sample_rate_, &brickwall_hp_coeffs_);
-
-		// The filter itself is a low cut only. Its low-pass sections instead
-		// produce the preview ("hear what's removed"): a complementary low-pass
-		// at the same cutoff and steepness, also -3dB at the cutoff. Subtracting
-		// the filtered signal from the input can't be used here, because this
-		// minimum-phase cascade shifts the phase of content far above the
-		// cutoff without changing its level, and that phase shift would leak
-		// into the difference (about -16dB at 1kHz for Ultra Steep).
-		double calibrated_lp_cutoff = filtBrickwallCalibrateCascadeCutoff((realtype)brickwall_hp_cutoff_hz_, (realtype)brickwall_cached_sample_rate_, num_sections, 0);
-		filtBrickwallDesignLowPass((realtype)calibrated_lp_cutoff, (realtype)brickwall_cached_sample_rate_, &brickwall_lp_coeffs_);
-	}
-
-	// With a 0Hz cutoff nothing is removed, so the preview is silent.
-	brickwall_num_hp_sections_ = hp_bypassed ? 0 : num_sections;
-	brickwall_num_lp_sections_ = hp_bypassed ? 0 : num_sections;
-}
-
-void DfxDspPrivate::resetBrickwallFilterState()
-{
-	int channel;
-
-	for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
-	{
-		filtBrickwallResetChannelState(&brickwall_channel_states_[channel]);
-	}
-}
-
-void DfxDspPrivate::requestBrickwallFirDesign()
+/*
+ * FUNCTION: DfxDspPrivate::requestBrickwallDesign()
+ * DESCRIPTION:
+ *   Asks the designer thread for a new IIR parameter set (and, when linear
+ *   phase is on, a new linear-phase filter) for the latest settings. Bursts
+ *   are coalesced. wake_designer wakes it at once; it must be false on the
+ *   audio thread, where the request is picked up on the designer's next timed
+ *   wake instead. Taking the mutex between the increment and the notify means
+ *   the designer either sees the new generation in its wait predicate or is
+ *   already waiting and gets the notification, so no UI request is lost.
+ */
+void DfxDspPrivate::requestBrickwallDesign(bool wake_designer)
 {
 	brickwall_fir_request_generation_.fetch_add(1, std::memory_order_acq_rel);
+
+	if (wake_designer)
+	{
+		{
+			std::lock_guard<std::mutex> lock(brickwall_designer_mutex_);
+		}
+		brickwall_designer_wake_.notify_one();
+	}
 }
 
 /*
  * FUNCTION: DfxDspPrivate::brickwallDesignerThreadMain()
  * DESCRIPTION:
- *   Background thread that does all linear-phase design work, so the audio
- *   thread (which also runs setSignalFormat()) never designs filters or
- *   allocates. Every ~20ms it frees an engine the audio thread has retired
- *   and, if a newer request is waiting and linear phase is on, designs the
- *   latest requested filter (bursts are coalesced). A cutoff-only change on an
- *   engine of the same configuration is a filter swap that keeps the audio
- *   history; anything else (sample rate, channels, latency mode, or a reset
- *   serial bumped because filtering resumed) builds a new engine with empty
- *   history. The reset serial is read before the engine is created and
- *   stamped on it, so an engine carrying serial S was provably created (with
- *   empty history) after the UI bumped the serial to S.
+ *   Background thread that does all filter design work, so neither the UI
+ *   thread nor the audio thread (which also runs setSignalFormat()) ever
+ *   designs filters or allocates for the audio path. It sleeps until a
+ *   request notifies it, or for at most 200ms (requests from the audio thread
+ *   don't notify). Each time it frees an engine the audio thread has retired
+ *   and, if a newer request is waiting, handles the latest one (bursts are
+ *   coalesced):
+ *     - Zero Latency: always designs a fresh IIR parameter set for the
+ *       requested sample rate, steepness and cutoff, stamped with the reset
+ *       serial, and publishes it through brickwall_iir_exchange_ - whether or
+ *       not linear phase is on, so a current set is ready the moment the
+ *       Zero Latency path runs again.
+ *     - Linear phase (only while it is on): a cutoff-only change on an engine
+ *       of the same configuration is a filter swap that keeps the audio
+ *       history; anything else (sample rate, channels, latency mode, or a
+ *       reset serial bumped because filtering resumed) builds a new engine
+ *       with empty history.
+ *   The reset serial is read after the request generation (every setter
+ *   bumps it before the generation), and before the engine is created and
+ *   stamped with it, so an engine or set carrying serial S was provably
+ *   designed after the serial was bumped to S.
  */
 void DfxDspPrivate::brickwallDesignerThreadMain()
 {
@@ -800,13 +1051,14 @@ void DfxDspPrivate::brickwallDesignerThreadMain()
 	int latest_mode = -1;
 	unsigned int latest_reset_serial = 0;
 	std::vector<realtype> coeffs;
+	std::unique_lock<std::mutex> lock(brickwall_designer_mutex_, std::defer_lock);
 
 	while (!brickwall_designer_stop_)
 	{
 		filtPartConvDestroy(brickwall_fir_retired_engine_.exchange(nullptr, std::memory_order_acq_rel));
 
 		unsigned int generation = brickwall_fir_request_generation_.load(std::memory_order_acquire);
-		if (generation != handled_generation && brickwall_linear_phase_on_)
+		if (generation != handled_generation)
 		{
 			handled_generation = generation;
 
@@ -814,40 +1066,54 @@ void DfxDspPrivate::brickwallDesignerThreadMain()
 			int num_channels = brickwall_fir_request_num_channels_;
 			int mode = brickwall_fir_latency_mode_;
 			unsigned int reset_serial = brickwall_fir_reset_serial_.load(std::memory_order_acquire);
-			int block_size = brickwallFirBlockSizeForMode(mode);
-			int num_taps = filtBrickwallFirNumTaps((realtype)brickwallFirLatencyMsForMode(mode), (realtype)sample_rate, block_size);
+			float cutoff_hz = brickwall_hp_cutoff_hz_.load();
+			BrickwallIirParams iir_params;
 
-			coeffs.resize(num_taps);
-			filtBrickwallFirDesignKaiser(
-				(realtype)brickwall_hp_cutoff_hz_.load(),
-				(realtype)sample_rate, num_taps, coeffs.data());
+			brickwallDesignIirParams(sample_rate, brickwall_filter_steepness_.load(), cutoff_hz, reset_serial, &iir_params);
+			brickwallIirExchangePublish(&brickwall_iir_exchange_, &iir_params);
 
-			if (latest_engine != nullptr && reset_serial == latest_reset_serial &&
-				sample_rate == latest_sample_rate && num_channels == latest_num_channels && mode == latest_mode)
+			if (brickwall_linear_phase_on_)
 			{
-				filtPartConvPublishFilter(latest_engine, coeffs.data(), num_taps);
-			}
-			else
-			{
-				FiltPartConv *engine = filtPartConvCreate(block_size, num_taps, num_channels, coeffs.data());
+				int block_size = brickwallFirBlockSizeForMode(mode);
+				int num_taps = filtBrickwallFirNumTaps((realtype)brickwallFirLatencyMsForMode(mode), (realtype)sample_rate, block_size);
 
-				if (engine != nullptr)
+				coeffs.resize(num_taps);
+				filtBrickwallFirDesignKaiser(
+					(realtype)cutoff_hz,
+					(realtype)sample_rate, num_taps, coeffs.data());
+
+				if (latest_engine != nullptr && reset_serial == latest_reset_serial &&
+					sample_rate == latest_sample_rate && num_channels == latest_num_channels && mode == latest_mode)
 				{
-					engine->tag = sample_rate;
-					engine->serial = reset_serial;
-					// A pending engine the audio thread never adopted is replaced
-					// and freed here; it was never seen by the audio thread.
-					filtPartConvDestroy(brickwall_fir_pending_engine_.exchange(engine, std::memory_order_acq_rel));
-					latest_engine = engine;
-					latest_sample_rate = sample_rate;
-					latest_num_channels = num_channels;
-					latest_mode = mode;
-					latest_reset_serial = reset_serial;
+					filtPartConvPublishFilter(latest_engine, coeffs.data(), num_taps);
+				}
+				else
+				{
+					FiltPartConv *engine = filtPartConvCreate(block_size, num_taps, num_channels, coeffs.data());
+
+					if (engine != nullptr)
+					{
+						engine->tag = sample_rate;
+						engine->serial = reset_serial;
+						// A pending engine the audio thread never adopted is replaced
+						// and freed here; it was never seen by the audio thread.
+						filtPartConvDestroy(brickwall_fir_pending_engine_.exchange(engine, std::memory_order_acq_rel));
+						latest_engine = engine;
+						latest_sample_rate = sample_rate;
+						latest_num_channels = num_channels;
+						latest_mode = mode;
+						latest_reset_serial = reset_serial;
+					}
 				}
 			}
 		}
 
-		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		lock.lock();
+		brickwall_designer_wake_.wait_for(lock, std::chrono::milliseconds(200), [this, handled_generation]() {
+			return brickwall_designer_stop_.load() ||
+				brickwall_fir_request_generation_.load(std::memory_order_acquire) != handled_generation;
+			});
+		lock.unlock();
 	}
 }
 
@@ -885,6 +1151,7 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 	// Bypassed when the filter is off or FxSound's power is off (see powerOn()).
 	if (!brickwall_filter_on_ || !brickwall_power_on_)
 	{
+		brickwall_iir_ran_last_buffer_ = false;
 		return;
 	}
 
@@ -898,10 +1165,19 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 		brickwall_preview_gain_ = 1.0f;
 	}
 	brickwall_preview_was_on_ = preview_on;
-	BrickwallPreviewLevelCoeffs level_coeffs = brickwallPreviewLevelCoeffs(brickwall_cached_sample_rate_);
+	// The leveller's coefficients only depend on the sample rate.
+	if (brickwall_preview_level_coeffs_rate_ != brickwall_cached_sample_rate_)
+	{
+		brickwall_preview_level_coeffs_ = brickwallPreviewLevelCoeffs(brickwall_cached_sample_rate_);
+		brickwall_preview_level_coeffs_rate_ = brickwall_cached_sample_rate_;
+	}
 
 	if (brickwall_linear_phase_on_)
 	{
+		// The Zero Latency path isn't fed while linear phase is on, so its
+		// history is stale when it next runs (see brickwallIirNeedsReset()).
+		brickwall_iir_ran_last_buffer_ = false;
+
 		// Linear-phase path: FFT partitioned convolution. Engines are built on
 		// the designer thread; this thread only adopts a finished one. Until an
 		// engine matching the current format is ready, audio passes through
@@ -939,7 +1215,7 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 				{
 					frame[channel] = dry[channel] - frame[channel];
 				}
-				brickwallLevelPreviewFrame(frame, engine->num_channels, &level_coeffs,
+				brickwallLevelPreviewFrame(frame, engine->num_channels, &brickwall_preview_level_coeffs_,
 					&brickwall_preview_mean_square_, &brickwall_preview_gain_);
 			}
 		}
@@ -948,17 +1224,49 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 	}
 
 	{
-		// Section counts are cached by updateBrickwallFilterCoefficients() (the
-		// high-pass count is 0 when the user's low cutoff is 0Hz).
-		int num_hp_sections = brickwall_num_hp_sections_;
-		int num_lp_sections = brickwall_num_lp_sections_;
+		// Zero Latency path. Adopt the newest parameter set the designer thread
+		// has published, if any (lock-free; see brickwallIirExchangeAdopt()).
+		// Until a set designed for the current sample rate and the current
+		// reset serial is ready, audio passes through unfiltered - the same
+		// rule as the linear-phase path.
+		const BrickwallIirParams *params = brickwallIirExchangeAdopt(&brickwall_iir_exchange_);
+
+		if (params->sample_rate != brickwall_cached_sample_rate_ ||
+			params->reset_serial != brickwall_fir_reset_serial_.load(std::memory_order_acquire))
+		{
+			brickwall_iir_ran_last_buffer_ = false;
+			return;
+		}
+
+		int processed_channels = (brickwall_cached_num_channels_ < FILT_BRICKWALL_MAX_CHANNELS) ?
+			brickwall_cached_num_channels_ : FILT_BRICKWALL_MAX_CHANNELS;
+
+		// History is only ever reset here, on the audio thread, so it never
+		// races the cascade. A cutoff-only change keeps it (no click while
+		// dragging the cutoff slider).
+		if (brickwallIirNeedsReset(params, brickwall_iir_history_serial_, brickwall_iir_history_hp_sections_,
+			brickwall_iir_history_lp_sections_, brickwall_iir_ran_last_buffer_))
+		{
+			for (channel = 0; channel < FILT_BRICKWALL_MAX_CHANNELS; channel++)
+			{
+				filtBrickwallResetChannelState(&brickwall_channel_states_[channel]);
+			}
+			brickwall_iir_history_serial_ = params->reset_serial;
+			brickwall_iir_history_hp_sections_ = params->num_hp_sections;
+			brickwall_iir_history_lp_sections_ = params->num_lp_sections;
+		}
+		brickwall_iir_ran_last_buffer_ = true;
+
+		// The high-pass count is 0 when the user's low cutoff is 0Hz.
+		int num_hp_sections = params->num_hp_sections;
+		int num_lp_sections = params->num_lp_sections;
 
 		// Defensive clamp: brickwallNumSectionsForSteepness() only ever returns
 		// 1/4/8/11, but filtBrickwallProcessSample() does not itself bounds-check
 		// its section counts against FILT_BRICKWALL_MAX_SECTIONS before indexing
-		// into fixed-size arrays (Task 1 library code is generic and doesn't know
+		// into fixed-size arrays (the library code is generic and doesn't know
 		// about steepness policy). Clamp here, in the real-time audio path, as a
-		// safety net beyond what the brief's code shows.
+		// safety net.
 		if (num_hp_sections > FILT_BRICKWALL_MAX_SECTIONS)
 		{
 			num_hp_sections = FILT_BRICKWALL_MAX_SECTIONS;
@@ -976,9 +1284,6 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 			num_lp_sections = 0;
 		}
 
-		int processed_channels = (brickwall_cached_num_channels_ < FILT_BRICKWALL_MAX_CHANNELS) ?
-			brickwall_cached_num_channels_ : FILT_BRICKWALL_MAX_CHANNELS;
-
 		for (sample_index = 0; sample_index < num_sample_sets; sample_index++)
 		{
 			for (channel = 0; channel < processed_channels; channel++)
@@ -987,22 +1292,22 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 				realtype pre_filter_sample = (realtype)audio_buffer[buffer_index];
 
 				// The high-pass (the filter) and the complementary low-pass (the
-				// preview, see updateBrickwallFilterCoefficients()) both run on
-				// every sample, using separate section histories, so toggling the
+				// preview, see brickwallDesignIirParams()) both run on every
+				// sample, using separate section histories, so toggling the
 				// preview never starts either one from stale history.
 				realtype filtered_sample = filtBrickwallProcessSample(
 					pre_filter_sample,
 					num_hp_sections,
 					0,
-					&brickwall_hp_coeffs_,
-					&brickwall_lp_coeffs_,
+					&params->hp_coeffs,
+					&params->lp_coeffs,
 					&brickwall_channel_states_[channel]);
 				realtype removed_sample = filtBrickwallProcessSample(
 					pre_filter_sample,
 					0,
 					num_lp_sections,
-					&brickwall_hp_coeffs_,
-					&brickwall_lp_coeffs_,
+					&params->hp_coeffs,
+					&params->lp_coeffs,
 					&brickwall_channel_states_[channel]);
 
 				if (preview_on)
@@ -1018,7 +1323,7 @@ void DfxDspPrivate::applyBrickwallFilter(float *audio_buffer, int num_sample_set
 			if (preview_on)
 			{
 				brickwallLevelPreviewFrame(&audio_buffer[sample_index * brickwall_cached_num_channels_], processed_channels,
-					&level_coeffs, &brickwall_preview_mean_square_, &brickwall_preview_gain_);
+					&brickwall_preview_level_coeffs_, &brickwall_preview_mean_square_, &brickwall_preview_gain_);
 			}
 		}
 	}
@@ -1028,23 +1333,19 @@ void DfxDspPrivate::brickwallFilterOn(bool on)
 {
 	if (on)
 	{
-		bool was_on = brickwall_filter_on_;
-
-		// Prepare everything the audio thread reads before it can see the
-		// filter on, so this thread never rewrites the IIR cascade's
-		// coefficients or history while the audio thread is running it. The
-		// linear-phase engine isn't fed while the filter is off either, so
-		// resuming must not play its stale history: bump the reset serial
-		// first too (see brickwall_fir_reset_serial_).
-		updateBrickwallFilterCoefficients();
-		if (!was_on)
+		// Neither path is fed while the filter is off, so resuming must not
+		// play stale history. Bump the reset serial before the audio thread can
+		// see the filter on: it then passes audio through until a linear-phase
+		// engine or IIR parameter set stamped with the new serial is ready, and
+		// the IIR history is reset on the audio thread before it next runs (see
+		// brickwall_fir_reset_serial_ and brickwallIirNeedsReset()).
+		if (!brickwall_filter_on_)
 		{
-			resetBrickwallFilterState();
 			brickwall_fir_reset_serial_.fetch_add(1, std::memory_order_acq_rel);
 		}
 
 		brickwall_filter_on_ = true;
-		requestBrickwallFirDesign();
+		requestBrickwallDesign(true);
 	}
 	else
 	{
@@ -1060,14 +1361,26 @@ bool DfxDspPrivate::isBrickwallFilterOn()
 
 void DfxDspPrivate::setBrickwallFilterSteepness(DfxDsp::BrickwallSteepness steepness)
 {
-	brickwall_filter_steepness_ = steepness;
-	updateBrickwallFilterCoefficients();
-	resetBrickwallFilterState();
+	int value = static_cast<int>(steepness);
+
+	if (value < DfxDsp::BrickwallSteepness::Gentle)
+	{
+		value = DfxDsp::BrickwallSteepness::Gentle;
+	}
+	else if (value > DfxDsp::BrickwallSteepness::UltraSteep)
+	{
+		value = DfxDsp::BrickwallSteepness::UltraSteep;
+	}
+
+	// The designer thread designs the new cascade; the audio thread resets its
+	// history when it adopts a set with a different section count.
+	brickwall_filter_steepness_ = value;
+	requestBrickwallDesign(true);
 }
 
 DfxDsp::BrickwallSteepness DfxDspPrivate::getBrickwallFilterSteepness()
 {
-	return brickwall_filter_steepness_;
+	return static_cast<DfxDsp::BrickwallSteepness>(brickwall_filter_steepness_.load());
 }
 
 void DfxDspPrivate::brickwallFilterPreviewOn(bool on)
@@ -1084,6 +1397,8 @@ void DfxDspPrivate::brickwallFilterLinearPhaseOn(bool on)
 {
 	// As in brickwallFilterOn(): the engine isn't fed while linear phase is
 	// off, so bump the reset serial before the audio thread can see it on.
+	// (Turning it off needs nothing: the Zero Latency path resets its own
+	// history when it next runs, see brickwallIirNeedsReset().)
 	if (on && !brickwall_linear_phase_on_)
 	{
 		brickwall_fir_reset_serial_.fetch_add(1, std::memory_order_acq_rel);
@@ -1092,7 +1407,7 @@ void DfxDspPrivate::brickwallFilterLinearPhaseOn(bool on)
 	brickwall_linear_phase_on_ = on;
 	if (on)
 	{
-		requestBrickwallFirDesign();
+		requestBrickwallDesign(true);
 	}
 }
 
@@ -1122,21 +1437,14 @@ void DfxDspPrivate::setBrickwallFilterHighPassCutoff(float cutoff_hz)
 		cutoff_hz = DFXG_BRICKWALL_HIGH_PASS_CUTOFF_MAX_HZ;
 	}
 
-	bool was_hp_bypassed = brickwall_hp_cutoff_hz_ <= 0.0f;
-	brickwall_hp_cutoff_hz_ = cutoff_hz;
-
-	updateBrickwallFilterCoefficients();
-	requestBrickwallFirDesign();
-
 	// Unlike a steepness change, moving the cutoff keeps the section count and
-	// FIR tap count the same, so existing filter history stays valid and is kept
-	// - resetting it on every step of a slider drag would cause audible
-	// dropouts. The one exception is re-enabling a bypassed high-pass band,
-	// whose section history is stale from whenever it was last running.
-	if (was_hp_bypassed && cutoff_hz > 0.0f)
-	{
-		resetBrickwallFilterState();
-	}
+	// FIR tap count the same, so existing filter history stays valid and is
+	// kept - resetting it on every step of a slider drag would cause audible
+	// dropouts. The one exception, re-enabling a bypassed (0Hz) high-pass band,
+	// changes the IIR section count, so the audio thread resets that history
+	// when it adopts the new set (see brickwallIirNeedsReset()).
+	brickwall_hp_cutoff_hz_ = cutoff_hz;
+	requestBrickwallDesign(true);
 }
 
 float DfxDspPrivate::getBrickwallFilterHighPassCutoff()
@@ -1158,7 +1466,7 @@ void DfxDspPrivate::setBrickwallFilterLinearPhaseLatency(DfxDsp::BrickwallLinear
 	}
 
 	brickwall_fir_latency_mode_ = mode;
-	requestBrickwallFirDesign();
+	requestBrickwallDesign(true);
 }
 
 DfxDsp::BrickwallLinearPhaseLatency DfxDspPrivate::getBrickwallFilterLinearPhaseLatency()
@@ -1184,17 +1492,17 @@ void DfxDspPrivate::powerOn(bool on)
 
 	// The low cut filter runs after the effects (see processAudio()), so the
 	// effects' bypass above doesn't cover it: bypass it here too. Neither of
-	// its paths is fed while power is off, so on resuming, clear the IIR
-	// history and invalidate the linear-phase engine's history first - all
-	// before the audio thread can see power on, as in brickwallFilterOn().
+	// its paths is fed while power is off, so on resuming, invalidate their
+	// history first (bump the reset serial) - before the audio thread can see
+	// power on, as in brickwallFilterOn(). The IIR history itself is reset on
+	// the audio thread.
 	if (on)
 	{
 		if (!brickwall_power_on_)
 		{
-			resetBrickwallFilterState();
 			brickwall_fir_reset_serial_.fetch_add(1, std::memory_order_acq_rel);
 			brickwall_power_on_ = true;
-			requestBrickwallFirDesign();
+			requestBrickwallDesign(true);
 		}
 	}
 	else
