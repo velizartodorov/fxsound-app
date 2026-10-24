@@ -42,6 +42,8 @@ public:
     static constexpr int WINDOW_CORNER_RADIUS = 21;
 	static constexpr int TITLE_BAR_HEIGHT = 57;
 	static constexpr int SLIDER_THUMB_RADIUS = 8;
+	// Slider property: the track uses the full width (its value label flips to the left past halfway instead).
+	static constexpr const char* FULL_TRACK_PROPERTY = "fxFullTrack";
     static constexpr int ROTARY_SLIDER_THUMB_RADIUS = 5;
 
 	FxTheme();

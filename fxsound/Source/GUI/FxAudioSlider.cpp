@@ -76,6 +76,66 @@ void FxAudioSlider::setWheelStepsByInterval(bool steps_by_interval)
 	wheel_steps_by_interval_ = steps_by_interval;
 }
 
+void FxAudioSlider::setWheelMaxNotchStep(double notch_step)
+{
+	wheel_max_notch_step_ = notch_step;
+}
+
+void FxAudioSlider::setValueLabelBelow(bool below)
+{
+	value_label_below_ = below;
+	getProperties().set(FxTheme::FULL_TRACK_PROPERTY, below);
+	value_label_.setJustificationType(below ? Justification::centred : Justification::centredLeft);
+	parentHierarchyChanged();
+	resized();
+}
+
+juce::Rectangle<int> FxAudioSlider::valueLabelBelowBounds(Slider& slider, int label_width, int label_height)
+{
+	auto centre = slider.getX() + static_cast<int>(slider.getPositionOfValue(slider.getValue()));
+	auto x = jlimit(slider.getX(), jmax(slider.getX(), slider.getRight() - label_width), centre - label_width / 2);
+
+	return { x, slider.getBottom(), label_width, label_height };
+}
+
+void FxAudioSlider::moved()
+{
+	if (value_label_below_)
+	{
+		updateLabel();
+	}
+}
+
+void FxAudioSlider::parentHierarchyChanged()
+{
+	Component* host = value_label_below_ ? getParentComponent() : this;
+
+	if (host != nullptr && value_label_.getParentComponent() != host)
+	{
+		host->addAndMakeVisible(value_label_);
+		updateLabel();
+	}
+}
+
+void FxAudioSlider::enablementChanged()
+{
+	Slider::enablementChanged();
+	value_label_.setEnabled(isEnabled());
+}
+
+void FxAudioSlider::alphaChanged()
+{
+	// The value label may live in the parent (below the slider), so it follows the slider's alpha explicitly.
+	value_label_.setAlpha(getAlpha());
+}
+
+static float wheelDelta(const MouseWheelDetails& wheel)
+{
+	float delta = (std::abs(wheel.deltaX) > std::abs(wheel.deltaY)) ? -wheel.deltaX : wheel.deltaY;
+
+	return wheel.isReversed ? -delta : delta;
+}
+
 bool FxAudioSlider::stepByWheel(Slider& slider, const MouseWheelDetails& wheel)
 {
 	if (wheel.isSmooth || !slider.isEnabled() || !slider.isScrollWheelEnabled())
@@ -83,11 +143,7 @@ bool FxAudioSlider::stepByWheel(Slider& slider, const MouseWheelDetails& wheel)
 		return false;
 	}
 
-	float delta = (std::abs(wheel.deltaX) > std::abs(wheel.deltaY)) ? -wheel.deltaX : wheel.deltaY;
-	if (wheel.isReversed)
-	{
-		delta = -delta;
-	}
+	float delta = wheelDelta(wheel);
 	if (delta != 0.0f)
 	{
 		slider.setValue(slider.getValue() + ((delta > 0.0f) ? slider.getInterval() : -slider.getInterval()), NotificationType::sendNotificationSync);
@@ -95,9 +151,101 @@ bool FxAudioSlider::stepByWheel(Slider& slider, const MouseWheelDetails& wheel)
 	return true;
 }
 
+// Every notch counts (Windows merges the notches of a fast spin into one event; finer wheels report less than a notch
+// per event and count as one) and moves by a step that grows with the logarithm of the wheel speed: one interval up to
+// WHEEL_SLOW_NOTCHES_PER_S, wheel_max_notch_step_ from WHEEL_FAST_NOTCHES_PER_S, the same increase for every doubling in
+// between. The speed is a running average, so one late or early event does not make the step jump, and the fraction
+// of a step the value cannot take (it moves in whole intervals) carries over to the next notch.
+bool FxAudioSlider::stepByWheelAccelerated(const MouseEvent& event, const MouseWheelDetails& wheel)
+{
+	if (wheel.isSmooth || !isEnabled() || !isScrollWheelEnabled())
+	{
+		return false;
+	}
+
+	float delta = wheelDelta(wheel);
+	if (delta == 0.0f)
+	{
+		return true;
+	}
+
+	int notches = jmax(1, roundToInt(std::abs(delta) / WHEEL_NOTCH_DELTA));
+	int direction = (delta > 0.0f) ? 1 : -1;
+	auto since_last = (last_wheel_time_ != Time()) ? (event.eventTime - last_wheel_time_).inMilliseconds() : (int64)WHEEL_PAUSE_MS;
+
+	last_wheel_time_ = event.eventTime;
+	// The first notch, one after a pause and one that turns back start again from slow.
+	if (since_last >= WHEEL_PAUSE_MS || direction != wheel_direction_)
+	{
+		wheel_speed_ = 0.0;
+		wheel_remainder_ = 0.0;
+		stopWheelGlide();
+	}
+	else
+	{
+		double notches_per_s = notches * 1000.0 / (double)jmax((int64)1, since_last);
+		wheel_speed_ += WHEEL_SPEED_SMOOTHING * (notches_per_s - wheel_speed_);
+	}
+	wheel_direction_ = direction;
+
+	double speed = jlimit(0.0, 1.0, std::log(jmax(wheel_speed_, WHEEL_SLOW_NOTCHES_PER_S) / WHEEL_SLOW_NOTCHES_PER_S) /
+		std::log(WHEEL_FAST_NOTCHES_PER_S / WHEEL_SLOW_NOTCHES_PER_S));
+	double interval = getInterval();
+	double move = wheel_remainder_ + notches * (interval + (wheel_max_notch_step_ - interval) * speed);
+	double whole = interval * std::floor(move / interval + 1e-9);
+
+	wheel_remainder_ = move - whole;
+	if (whole > 0.0)
+	{
+		// Further notches during a glide extend its target; the first frame runs now, so a notch responds at once.
+		double base = wheel_gliding_ ? wheel_target_ : getValue();
+
+		wheel_target_ = jlimit(getMinimum(), getMaximum(), base + direction * whole);
+		if (!wheel_gliding_)
+		{
+			wheel_gliding_ = true;
+			wheel_glide_value_ = getValue();
+			startTimerHz(WHEEL_GLIDE_HZ);
+		}
+		timerCallback();
+	}
+	return true;
+}
+
+void FxAudioSlider::timerCallback()
+{
+	// A drag, a reset or a preset load moved the value: that wins over the glide.
+	if (getValue() != wheel_glide_value_)
+	{
+		stopWheelGlide();
+		return;
+	}
+
+	double interval = getInterval();
+	double left = wheel_target_ - getValue();
+	if (std::abs(left) < interval * 0.5)
+	{
+		stopWheelGlide();
+		return;
+	}
+
+	double move = jmin(std::abs(left), interval * std::ceil(std::abs(left) * WHEEL_GLIDE_FRACTION / interval - 1e-9));
+	setValue(getValue() + ((left > 0.0) ? move : -move), NotificationType::sendNotificationSync);
+	wheel_glide_value_ = getValue();
+}
+
+void FxAudioSlider::stopWheelGlide()
+{
+	stopTimer();
+	wheel_gliding_ = false;
+}
+
 void FxAudioSlider::mouseWheelMove(const MouseEvent& event, const MouseWheelDetails& wheel)
 {
-	if (!wheel_steps_by_interval_ || !stepByWheel(*this, wheel))
+	bool handled = wheel_steps_by_interval_ &&
+		((wheel_max_notch_step_ > getInterval()) ? stepByWheelAccelerated(event, wheel) : stepByWheel(*this, wheel));
+
+	if (!handled)
 	{
 		Slider::mouseWheelMove(event, wheel);
 	}
@@ -105,6 +253,8 @@ void FxAudioSlider::mouseWheelMove(const MouseEvent& event, const MouseWheelDeta
 
 void FxAudioSlider::mouseDown(const juce::MouseEvent& event)
 {
+	stopWheelGlide();
+
 	// Check if right mouse button is pressed, or this is a double-click
 	if (event.mods.isRightButtonDown() || event.getNumberOfClicks() >= 2)
 	{
@@ -132,13 +282,42 @@ void FxAudioSlider::setZeroValueText(const String& text)
 	}
 }
 
+void FxAudioSlider::setMaxValueText(const String& text)
+{
+	if (max_value_text_ != text)
+	{
+		max_value_text_ = text;
+		updateLabel();
+	}
+}
+
 void FxAudioSlider::updateLabel()
 {
 	auto value = getValue();
 
 	// Update label text
-	auto text = (zero_value_text_.isNotEmpty() && value == 0.0) ? zero_value_text_ : String::formatted(label_format_, value);
+	String text;
+	if (zero_value_text_.isNotEmpty() && value == 0.0)
+	{
+		text = zero_value_text_;
+	}
+	else if (max_value_text_.isNotEmpty() && value >= getMaximum())
+	{
+		text = max_value_text_;
+	}
+	else
+	{
+		text = String::formatted(label_format_, value);
+	}
 	value_label_.setText(text, NotificationType::dontSendNotification);
+
+	if (value_label_below_)
+	{
+		auto text_width = static_cast<int>(GlyphArrangement::getStringWidth(value_label_.getFont(), text)) +
+			value_label_.getBorderSize().getLeftAndRight() + 2;
+		value_label_.setBounds(valueLabelBelowBounds(*this, text_width, LABEL_HEIGHT));
+		return;
+	}
 
 	// Position label based on slider thumb position
 	auto pos = getPositionOfValue(value);

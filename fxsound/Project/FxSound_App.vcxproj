@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|ARM64">
@@ -2224,6 +2224,10 @@ copy $(TargetDir)$(TargetName).pdb ..\..\bin\$(PlatformTarget)\ /y
     <ClCompile Include="..\JuceLibraryCode\include_juce_gui_basics.cpp">
       <AdditionalOptions> /bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
+    <ClCompile Include="..\JuceLibraryCode\include_juce_gui_basics_2.cpp"><AdditionalOptions> /bigobj %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <ClCompile Include="..\JuceLibraryCode\include_juce_gui_basics_3.cpp"><AdditionalOptions> /bigobj %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <ClCompile Include="..\JuceLibraryCode\include_juce_gui_basics_4.cpp"><AdditionalOptions> /bigobj %(AdditionalOptions)</AdditionalOptions></ClCompile>
+    <ClCompile Include="..\JuceLibraryCode\include_juce_gui_basics_5.cpp"><AdditionalOptions> /bigobj %(AdditionalOptions)</AdditionalOptions></ClCompile>
     <ClCompile Include="..\JuceLibraryCode\include_juce_gui_extra.cpp" />
     <ClCompile Include="..\JuceLibraryCode\include_juce_opengl.cpp" />
   </ItemGroup>
