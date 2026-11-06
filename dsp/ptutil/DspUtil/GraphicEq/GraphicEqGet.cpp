@@ -25,6 +25,50 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "u_GraphicEq.h"
 
 /*
+ * The dial range of band i_band_num (1-based) when num_bands (> 1) bands span r_min_band_freq..r_max_band_freq:
+ * from halfway (on a log scale) to the previous band's position, to halfway to the next one; the first and last
+ * bands are pinned to the span's edges.
+ */
+static void BandRangeForSpan(realtype r_min_band_freq, realtype r_max_band_freq, int num_bands, int i_band_num,
+    float *fp_min_freq, float *fp_max_freq)
+{
+    double d_ratio = (double)r_max_band_freq / (double)r_min_band_freq;
+    double d_power, d_factor;
+
+    if (i_band_num == 1)
+    {
+        /* Pin to the fixed ISO spectrum edge, not the band's own (possibly preset-shifted) frequency */
+        *fp_min_freq = r_min_band_freq;
+    }
+    else
+    {
+        d_power = (double)((i_band_num-1)*2 - 1) / (double)(num_bands*2 - 2);
+
+        d_factor = pow(d_ratio, d_power);
+
+        *fp_min_freq = roundf((realtype)(r_min_band_freq * d_factor));
+        if (*fp_min_freq < 1000)
+            (*fp_min_freq)++;
+        else
+            (*fp_min_freq)+=10;
+    }
+
+    if (i_band_num == num_bands)
+    {
+        /* Pin to the fixed ISO spectrum edge, not the band's own (possibly preset-shifted) frequency */
+        *fp_max_freq = r_max_band_freq;
+    }
+    else
+    {
+        d_power = (double)(i_band_num*2 - 1) / (double)(num_bands*2 - 2);
+
+        d_factor = pow(d_ratio, d_power);
+
+        *fp_max_freq = roundf((realtype)(r_min_band_freq * d_factor));
+    }
+}
+
+/*
  * FUNCTION: GraphicEqGetNumBands()
  * DESCRIPTION:
  *  Gets the number of bands.
@@ -106,7 +150,6 @@ int PT_DECLSPEC GraphicEqGetBandFrequencyRange(PT_HANDLE *hp_GraphicEq, int i_ba
 {
     struct GraphicEqHdlType *cast_handle;
     realtype *rp_freq_array;
-    double d_ratio, d_power, d_factor;
 
     cast_handle = (struct GraphicEqHdlType *)(hp_GraphicEq);
 
@@ -129,40 +172,64 @@ int PT_DECLSPEC GraphicEqGetBandFrequencyRange(PT_HANDLE *hp_GraphicEq, int i_ba
     }
     else
     {
-        d_ratio = (double)cast_handle->max_band_freq / (double)cast_handle->min_band_freq;
-
-        if (i_band_num == 1)
-        {
-            /* Pin to the fixed ISO spectrum edge, not the band's own (possibly preset-shifted) frequency */
-            *fp_min_freq = cast_handle->min_band_freq;
-        }
-        else
-        {
-            d_power = (double)((i_band_num-1)*2 - 1) / (double)(cast_handle->num_bands*2 - 2);
-
-            d_factor = pow(d_ratio, d_power);
-
-            *fp_min_freq = roundf((realtype)(cast_handle->min_band_freq * d_factor));
-            if (*fp_min_freq < 1000)
-                (*fp_min_freq)++;
-            else
-                (*fp_min_freq)+=10;
-        }
-
-        if (i_band_num == cast_handle->num_bands)
-        {
-            /* Pin to the fixed ISO spectrum edge, not the band's own (possibly preset-shifted) frequency */
-            *fp_max_freq = cast_handle->max_band_freq;
-        }
-        else
-        {
-            d_power = (double)(i_band_num*2 - 1) / (double)(cast_handle->num_bands*2 - 2);
-
-            d_factor = pow(d_ratio, d_power);
-
-            *fp_max_freq = roundf((realtype)(cast_handle->min_band_freq * d_factor));
-        }
+        BandRangeForSpan(cast_handle->min_band_freq, cast_handle->max_band_freq, cast_handle->num_bands, i_band_num,
+            fp_min_freq, fp_max_freq);
     }
+
+    return(OKAY);
+}
+
+int PT_DECLSPEC GraphicEqGetIsoLayout(PT_HANDLE *hp_GraphicEq, int *ip_iso)
+{
+    struct GraphicEqHdlType *cast_handle;
+
+    cast_handle = (struct GraphicEqHdlType *)(hp_GraphicEq);
+
+    if (cast_handle == NULL || ip_iso == NULL)
+        return(NOT_OKAY);
+
+    *ip_iso = cast_handle->iso_layout;
+
+    return(OKAY);
+}
+
+int PT_DECLSPEC GraphicEqFreqsFitIsoLayoutOnly(PT_HANDLE *hp_GraphicEq, int *ip_iso_only)
+{
+    struct GraphicEqHdlType *cast_handle;
+    realtype *rp_freq_array;
+    int num_bands;
+    bool fits_standard = true;
+    bool fits_iso = true;
+
+    cast_handle = (struct GraphicEqHdlType *)(hp_GraphicEq);
+
+    if (cast_handle == NULL || ip_iso_only == NULL)
+        return(NOT_OKAY);
+
+    *ip_iso_only = 0;
+
+    num_bands = cast_handle->num_bands;
+    if (num_bands != GRAPHIC_EQ_10_BAND_NUM_BANDS)
+        return(OKAY);
+
+    if (sosGetCenterFreqArray((PT_HANDLE *)(cast_handle->sos_hdl), &rp_freq_array) != OKAY)
+        return(NOT_OKAY);
+
+    for (int band = 1; band <= num_bands; band++)
+    {
+        float freq = (float)rp_freq_array[band - 1];
+        float lo, hi;
+
+        BandRangeForSpan(GRAPHIC_EQ_10_BAND_STANDARD_MIN_FREQ, GRAPHIC_EQ_10_BAND_MAX_FREQ, num_bands, band, &lo, &hi);
+        if (freq < lo || freq > hi)
+            fits_standard = false;
+
+        BandRangeForSpan(GRAPHIC_EQ_10_BAND_ISO_MIN_FREQ, GRAPHIC_EQ_10_BAND_MAX_FREQ, num_bands, band, &lo, &hi);
+        if (freq < lo || freq > hi)
+            fits_iso = false;
+    }
+
+    *ip_iso_only = (fits_iso && !fits_standard) ? 1 : 0;
 
     return(OKAY);
 }

@@ -111,6 +111,10 @@ public:
     void setEqBandFrequency(int band_num, float freq);
     void getEqBandFrequencyRange(int band_num, float* min_freq, float* max_freq);
     bool getDefaultEqBandFrequency(int band_num, float* freq);
+    // 10 band layout: Standard (false, the legacy grid presets load into) or ISO (true: 31, 62, 125 ... 16k).
+    // setEqIsoMode moves the bands to that layout's default frequencies and keeps their gains.
+    bool isEqIsoMode();
+    void setEqIsoMode(bool iso);
 	float getEqBandBoostCut(int band_num);
 	void setEqBandBoostCut(int band_num, float boost);
 	void powerOn(bool on);

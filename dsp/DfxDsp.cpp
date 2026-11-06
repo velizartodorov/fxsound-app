@@ -285,6 +285,16 @@ bool DfxDsp::getDefaultEqBandFrequency(int band_num, float* freq)
     return data_->getDefaultEqBandFrequency(band_num, freq);
 }
 
+bool DfxDsp::isEqIsoMode()
+{
+    return data_->isEqIsoMode();
+}
+
+void DfxDsp::setEqIsoMode(bool iso)
+{
+    data_->setEqIsoMode(iso);
+}
+
 float DfxDsp::getEqBandBoostCut(int band_num)
 {
 	return data_->getEqBandBoostCut(band_num);

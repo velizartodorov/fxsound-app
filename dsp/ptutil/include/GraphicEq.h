@@ -30,6 +30,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 // The standard ISO frequencies place octaves at
 //  15 bands = 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000
+//  20 bands = 20, 28, 40, 56, 80, 112, 160, 224, 315, 450, 630, 900, 1250, 1800, 2500, 3550, 5000, 7100,
+//             10000, 14000 (half octave, ISO R20 preferred numbers)
 //  31 Bands = 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 
 //             1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000
 
@@ -37,6 +39,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #define GRAPHIC_EQ_DEFAULT_LAST_BAND_FREQ 20000.0
 
 #define GRAPHIC_EQ_DEFAULT_SAMPLING_FREQ 44100.0
+
+/* The two 10 band layouts (lowest / highest band frequency). Standard is the legacy geometric grid presets were
+ * authored against; ISO is octave spacing, 31.25 Hz to 16 kHz (shown as 31, 62, 125 ... 16k). */
+#define GRAPHIC_EQ_10_BAND_NUM_BANDS 10
+#define GRAPHIC_EQ_10_BAND_STANDARD_MIN_FREQ 62.5f
+#define GRAPHIC_EQ_10_BAND_ISO_MIN_FREQ 31.25f
+#define GRAPHIC_EQ_10_BAND_MAX_FREQ 16000.0f
 
 /* Define lowest and highest band frequencies allowed */
 #define GRAPHIC_EQ_MIN_BAND_FREQ 10		               
@@ -63,12 +72,20 @@ int PT_DECLSPEC GraphicEqReCalcAllBandCoeffs(PT_HANDLE *hp_GraphicEq);
 int PT_DECLSPEC GraphicEqReSetAllBandFreqs(PT_HANDLE *hp_GraphicEq, realtype r_min_band_freq, realtype r_max_band_freq);
 int PT_DECLSPEC GraphicEqSetBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype r_band_freq);
 int PT_DECLSPEC GraphicEqGetDefaultBandFreq(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype *rp_band_freq);
+/* 10 bands only: switches between the Standard (0) and ISO (1) layout. With i_reset_freqs the bands move to that
+ * layout's default frequencies (gains are kept); without, only the band ranges and Q follow the layout (used when a
+ * preset's own frequencies already belong to it). Other band counts store the flag but are unaffected. */
+int PT_DECLSPEC GraphicEqSetIsoLayout(PT_HANDLE *hp_GraphicEq, int i_iso, int i_reset_freqs);
 
 /* GraphicEqGet.cpp */
 int PT_DECLSPEC GraphicEqGetNumBands(PT_HANDLE *hp_GraphicEq, int *ip_num_bands);
 int PT_DECLSPEC GraphicEqGetBandBoostCut(PT_HANDLE *hp_GraphicEq, int i_band_num, realtype *rp_boost_cut);
 int PT_DECLSPEC GraphicEqGetBandCenterFrequency(PT_HANDLE *hp_GraphicEq, int i_band_num, float *fp_center_freq);
 int PT_DECLSPEC GraphicEqGetBandFrequencyRange(PT_HANDLE *hp_GraphicEq, int i_band_num, float *fp_min_freq, float* fp_max_freq);
+int PT_DECLSPEC GraphicEqGetIsoLayout(PT_HANDLE *hp_GraphicEq, int *ip_iso);
+/* *ip_iso_only = 1 when there are 10 bands whose frequencies all fit the ISO layout's band ranges but not all the
+ * Standard ones (i.e. they were set in ISO mode), else 0. */
+int PT_DECLSPEC GraphicEqFreqsFitIsoLayoutOnly(PT_HANDLE *hp_GraphicEq, int *ip_iso_only);
 int PT_DECLSPEC GraphicEqGetMasterGain(PT_HANDLE* hp_GraphicEq, float* gain_db);
 int PT_DECLSPEC GraphicEqGetNormalization(PT_HANDLE* hp_GraphicEq, float* gain_db);
 int PT_DECLSPEC GraphicEqGetVolumeLeveling(PT_HANDLE* hp_GraphicEq, float* gain_db);

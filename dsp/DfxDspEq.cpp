@@ -241,6 +241,18 @@ int DfxDspPrivate::getGraphicEqInfoFromVals(PT_HANDLE *hp_vals)
 		}
 	}
 
+	// A loaded preset is in the Standard 10 band layout, unless its frequencies only fit the ISO layout (it was saved
+	// in ISO mode). Only the layout's ranges and Q change here; the preset's own frequencies stay.
+	PT_HANDLE* live_graphic_eq_handle;
+	dfxpEqGetGraphicEqHdl(dfxp_handle_, &live_graphic_eq_handle);
+	if (GraphicEqSetIsoLayout(live_graphic_eq_handle, 0, 0) != OKAY)
+		return(NOT_OKAY);
+	int iso_only = 0;
+	if (GraphicEqFreqsFitIsoLayoutOnly(live_graphic_eq_handle, &iso_only) != OKAY)
+		return(NOT_OKAY);
+	if (iso_only && GraphicEqSetIsoLayout(live_graphic_eq_handle, 1, 0) != OKAY)
+		return(NOT_OKAY);
+
 	return(OKAY);
 
 }
@@ -485,6 +497,27 @@ void DfxDspPrivate::getEqBandFrequencyRange(int band_num, float* min_freq, float
     dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
 
     GraphicEqGetBandFrequencyRange(graphic_eq_handle, band_num + 1, min_freq, max_freq);
+}
+
+bool DfxDspPrivate::isEqIsoMode()
+{
+    PT_HANDLE* graphic_eq_handle;
+    int iso = 0;
+
+    dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
+    GraphicEqGetIsoLayout(graphic_eq_handle, &iso);
+
+    return iso != 0;
+}
+
+void DfxDspPrivate::setEqIsoMode(bool iso)
+{
+    PT_HANDLE* graphic_eq_handle;
+
+    update_from_registry_ = true;
+
+    dfxpEqGetGraphicEqHdl(dfxp_handle_, &graphic_eq_handle);
+    GraphicEqSetIsoLayout(graphic_eq_handle, iso ? 1 : 0, 1);
 }
 
 bool DfxDspPrivate::getDefaultEqBandFrequency(int band_num, float* freq)
