@@ -1952,6 +1952,28 @@ bool FxController::getDefaultEqBandFrequency(int band_num, float* freq)
 	return false;
 }
 
+bool FxController::isEqIsoMode()
+{
+	return getNumEqBands() == 10 && dfx_dsp_.isEqIsoMode();
+}
+
+void FxController::setEqIsoMode(bool iso)
+{
+	if (getNumEqBands() != 10 || iso == isEqIsoMode())
+	{
+		return;
+	}
+
+	dfx_dsp_.setEqIsoMode(iso);
+
+	auto& model = FxModel::getModel();
+	if (!model.isPresetModified())
+	{
+		model.setPresetModified(model.getSelectedPreset(), true);
+	}
+	preset_dirty_ = true;
+}
+
 float FxController::getEqBandBoostCut(int band_num)
 {
 	if (band_num < getNumEqBands())

@@ -123,6 +123,11 @@ public:
     void setEqBandFrequency(int band_num, float freq);
     void getEqBandFrequencyRange(int band_num, float* min_freq, float* max_freq);
     bool getDefaultEqBandFrequency(int band_num, float* freq);
+    // 10 bands only: Standard layout (false; presets load into it unless they were saved in ISO mode) or ISO layout
+    // (true: 31, 62, 125 ... 16k). Switching moves the bands to that layout's defaults, keeps the gains and marks the
+    // preset modified.
+    bool isEqIsoMode();
+    void setEqIsoMode(bool iso);
 	float getEqBandBoostCut(int band_num);
 	void setEqBandBoostCut(int band_num, float boost);
     void getSpectrumBandValues(Array<float>& band_values);
