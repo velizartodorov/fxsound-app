@@ -27,6 +27,11 @@ FxEqualizer::FxEqualizer()
 {
     auto& controller = FxController::getInstance();
 
+    iso_button_.onClick = [this]() {
+        FxController::getInstance().setEqIsoMode(iso_button_.getToggleState());
+        refreshBandFrequencies();
+    };
+
     int num_bands = controller.getNumEqBands();
     labels_.resize(num_bands);
     band_boosts_.resize(num_bands);
@@ -51,15 +56,15 @@ FxEqualizer::FxEqualizer()
        
         center_frequencies_[i]->setRotaryParameters(3.66519f, 8.90118f, true);
         FxController::getInstance().getEqBandFrequencyRange(i, &min_freq, &max_freq);
-        // 1 Hz steps: a coarser interval (e.g. the previous span/100) quantizes to a
-        // grid anchored at this band's own min_freq, which doesn't line up with round
-        // reset frequencies (e.g. 1000 Hz was snapping to ~997 Hz).
-        center_frequencies_[i]->setRange(min_freq, max_freq, 1.0);
+        center_frequencies_[i]->setFrequencyRange(min_freq, max_freq);
         center_frequencies_[i]->setFrequency(controller.getEqBandFrequency(i));
         addAndMakeVisible(center_frequencies_[i].get());
 
         band_gain_values_[i] = 0;
     }
+
+    addChildComponent(iso_button_);
+    updateIsoButton();
 
     highlight_mode_ = false;
 
@@ -105,13 +110,15 @@ void FxEqualizer::reinit(int num_bands)
 
         center_frequencies_[i]->setRotaryParameters(3.66519f, 8.90118f, true);
         controller.getEqBandFrequencyRange(i, &min_freq, &max_freq);
-        // 1 Hz steps: see comment in the constructor above.
-        center_frequencies_[i]->setRange(min_freq, max_freq, 1.0);
+        center_frequencies_[i]->setFrequencyRange(min_freq, max_freq);
         center_frequencies_[i]->setFrequency(controller.getEqBandFrequency(i));
         addAndMakeVisible(center_frequencies_[i].get());
 
         band_gain_values_[i] = 0;
     }
+
+    addChildComponent(iso_button_);
+    updateIsoButton();
 
     resized();
 
@@ -213,9 +220,72 @@ void FxEqualizer::timerCallback()
     }
 }
 
+FxEqualizer::FxIsoModeButton::FxIsoModeButton() : Button("IsoModeButton")
+{
+    setButtonText(TRANS("ISO Mode"));
+    setClickingTogglesState(true);
+    setMouseCursor(MouseCursor::PointingHandCursor);
+    setWantsKeyboardFocus(true);
+}
+
+void FxEqualizer::FxIsoModeButton::paintButton(Graphics& g, bool highlighted, bool down)
+{
+    // On: the power-on colour (ImageButton: pink, or blue in the light theme). Off: the grey default text colour.
+    // Muted text and border, a very light fill; slightly stronger while hovered or pressed. Colours are read here, so
+    // a theme switch only needs a repaint. Disabled (with the rest of the EQ): grey, like the EQ curve, no hover.
+    bool on = getToggleState();
+    auto colour = on ? Colour(FXCOLOR(ImageButton)) : Colour(FXCOLOR(DefaultText));
+    float emphasis = (isEnabled() && (highlighted || down)) ? 0.15f : 0.0f;
+    if (!isEnabled())
+    {
+        colour = colour.withSaturation(0.0f).withMultipliedAlpha(0.6f);
+    }
+
+    auto box = getLocalBounds().toFloat().reduced(0.5f);
+    g.setColour(colour.withAlpha((on ? 0.08f : 0.05f) + emphasis * 0.5f));
+    g.fillRoundedRectangle(box, CORNER_RADIUS);
+    g.setColour(colour.withAlpha((on ? 0.5f : 0.3f) + emphasis));
+    g.drawRoundedRectangle(box, CORNER_RADIUS, 1.0f);
+
+    auto& theme = dynamic_cast<FxTheme&>(getLookAndFeel());
+    g.setFont(theme.getNormalFont().withHeight(FONT_HEIGHT));
+    g.setColour(colour.withAlpha((on ? 0.85f : 0.75f) + emphasis));
+    g.drawText(getButtonText(), getLocalBounds(), Justification::centred, false);
+}
+
+void FxEqualizer::updateIsoButton()
+{
+    auto& controller = FxController::getInstance();
+
+    iso_mode_shown_ = controller.isEqIsoMode();
+    iso_button_.setToggleState(iso_mode_shown_, NotificationType::dontSendNotification);
+    iso_button_.setVisible(controller.getNumEqBands() == 10);
+}
+
+void FxEqualizer::refreshBandFrequencies()
+{
+    auto& controller = FxController::getInstance();
+    float min_freq, max_freq;
+
+    for (auto i = 0; i < center_frequencies_.size() && i < controller.getNumEqBands(); i++)
+    {
+        controller.getEqBandFrequencyRange(i, &min_freq, &max_freq);
+        center_frequencies_[i]->setFrequencyRange(min_freq, max_freq);
+        center_frequencies_[i]->setFrequency(controller.getEqBandFrequency(i));
+    }
+
+    updateIsoButton();
+}
+
 void FxEqualizer::update()
 {
     auto& controller = FxController::getInstance();
+
+    // Loading a preset can switch the 10 band layout (Standard / ISO), which changes the dials' ranges.
+    if (controller.isEqIsoMode() != iso_mode_shown_)
+    {
+        refreshBandFrequencies();
+    }
 
     for (auto i = 0; i<band_boosts_.size() && i<controller.getNumEqBands(); i++)
     {
@@ -244,6 +314,14 @@ void FxEqualizer::resized()
 
     int num_bands = controller.getNumEqBands();
 
+    // Top-left corner of the page.
+    iso_button_.setBounds(ISO_BUTTON_X, ISO_BUTTON_Y, ISO_BUTTON_WIDTH, ISO_BUTTON_HEIGHT);
+
+    // With 10 bands the ISO Mode button is too wide for the margin beside the first slider, so the sliders start
+    // below the button row and are shorter by the same amount.
+    int sliders_top = (num_bands == 10) ? iso_button_.getBottom() + ISO_BUTTON_GAP : Y_MARGIN;
+    int slider_height = SLIDER_HEIGHT - (sliders_top - Y_MARGIN);
+
     if (num_bands != labels_.size())
     {
 		repaint();
@@ -269,7 +347,7 @@ void FxEqualizer::resized()
         if (show_center_frequencies)
         {
             labels_[i]->setFont(theme.getNormalFont().withHeight(LABEL_HEIGHT));
-            band_boosts_[i]->setBounds(x + (width - FxTheme::SLIDER_THUMB_RADIUS * 4) / 2, Y_MARGIN, FxTheme::SLIDER_THUMB_RADIUS * 4, SLIDER_HEIGHT );
+            band_boosts_[i]->setBounds(x + (width - FxTheme::SLIDER_THUMB_RADIUS * 4) / 2, sliders_top, FxTheme::SLIDER_THUMB_RADIUS * 4, slider_height);
             labels_[i]->setBounds(x, band_boosts_[i]->getBottom() + 6, width, LABEL_HEIGHT);
             center_frequencies_[i]->setBounds(x + (width - rotary_width) / 2, labels_[i]->getBottom() + 4, rotary_width, rotary_width);
         }
@@ -308,8 +386,11 @@ void FxEqualizer::updateTooltips(int num_bands)
             band_boosts_[i]->setTooltip("");
             center_frequencies_[i]->setTooltip("");
         }
+        iso_button_.setTooltip("");
         return;
     }
+
+    iso_button_.setTooltip(TRANS("ISO band layout: 31, 62, 125, 250, 500 Hz, 1, 2, 4, 8, 16 kHz. Loading a preset picks the layout its band frequencies fit."));
 
     StringArray tool_tips = { TRANS("Hyper-low Bass - First band for very low frequencies down to 20 Hz."),
                               TRANS("Super-low Bass. Increase this for more rumble and \"thump\", decrease if there's too much boominess."),
@@ -376,8 +457,8 @@ void FxEqualizer::paint(Graphics& g)
 
     for (auto i = 0; i < band_boosts_.size() - 1; i++)
     {
-        auto y0 = static_cast<float>(band_boosts_[i]->getPositionOfValue(band_boosts_[i]->getValue()) + Y_MARGIN);
-        auto y1 = static_cast<float>(band_boosts_[i + 1]->getPositionOfValue(band_boosts_[i + 1]->getValue()) + Y_MARGIN);
+        auto y0 = static_cast<float>(band_boosts_[i]->getPositionOfValue(band_boosts_[i]->getValue()) + band_boosts_[i]->getY());
+        auto y1 = static_cast<float>(band_boosts_[i + 1]->getPositionOfValue(band_boosts_[i + 1]->getValue()) + band_boosts_[i + 1]->getY());
 
         auto x0 = static_cast<float>(band_boosts_[i]->getX() + band_boosts_[i]->getWidth() / 2);
         auto x1 = static_cast<float>(band_boosts_[i + 1]->getX() + band_boosts_[i + 1]->getWidth() / 2);
@@ -401,7 +482,7 @@ void FxEqualizer::paint(Graphics& g)
     for (auto i = 0; i < band_boosts_.size(); i++) 
     {
         auto x = static_cast<float>(band_boosts_[i]->getX() + band_boosts_[i]->getWidth() / 2);
-        auto y = static_cast<float>(band_boosts_[i]->getPositionOfValue(band_boosts_[i]->getValue()) + Y_MARGIN);
+        auto y = static_cast<float>(band_boosts_[i]->getPositionOfValue(band_boosts_[i]->getValue()) + band_boosts_[i]->getY());
 
         if (i == 0)                                           
         {
@@ -524,6 +605,34 @@ void FxEqualizer::FxEqSlider::mouseDown(const juce::MouseEvent& event)
     }
 }
 
+namespace
+{
+    // A frequency to at most max_decimals decimals, without trailing zeros: 1.25, 1.36, 16.
+    String trimmedNumber(double value, int max_decimals)
+    {
+        auto text = String(value, max_decimals);
+        if (text.containsChar('.'))
+        {
+            text = text.trimCharactersAtEnd("0").trimCharactersAtEnd(".");
+        }
+        return text;
+    }
+
+    // "31 Hz", "62 Hz", "116 Hz", "1 kHz", "1.36 kHz", "16 kHz"; separator goes between the number and the unit.
+    // Hertz are whole numbers with halves rounded down, so the ISO layout's 31.25 and 62.5 read as the conventional
+    // 31 and 62.
+    String formatFrequency(double value, const String& separator)
+    {
+        // Rounded first, so a value just under 1000 (e.g. 999.7) reads "1 kHz" rather than "1000 Hz".
+        int hertz = roundToInt(value - 0.001);
+        if (value >= 1000.0 || hertz >= 1000)
+        {
+            return trimmedNumber(value / 1000.0, 2) + separator + "kHz";
+        }
+        return String(hertz) + separator + "Hz";
+    }
+}
+
 FxEqualizer::FxBandCenterFreqSlider::FxBandCenterFreqSlider(int band, Label& freq_label) : Slider(Slider::SliderStyle::Rotary, Slider::TextEntryBoxPosition::NoTextBox), freq_label_(freq_label)
 {
     band_ = band;
@@ -533,44 +642,47 @@ FxEqualizer::FxBandCenterFreqSlider::FxBandCenterFreqSlider(int band, Label& fre
     setWantsKeyboardFocus(true);
 }
 
+void FxEqualizer::FxBandCenterFreqSlider::setFrequencyRange(float min_freq, float max_freq)
+{
+    // Linear, with a 1 Hz interval like the original dial, so dragging and Slider's own mouse wheel handling (which
+    // moves by the wheel's share of the range, at least one interval) feel as before. The legal-value function only
+    // clamps, so values set from code keep their exact frequency (e.g. 62.5) instead of snapping to a 1 Hz grid
+    // anchored at the range start; user drags and wheel moves are rounded to whole hertz in snapValue.
+    double lo = min_freq;
+    double hi = jmax((double)max_freq, lo + 1.0);
+    NormalisableRange<double> range(lo, hi,
+        [](double start, double end, double proportion) { return start + (end - start) * proportion; },
+        [](double start, double end, double value) { return (value - start) / (end - start); },
+        [](double start, double end, double value) { return jlimit(start, end, value); });
+    range.interval = 1.0;
+    setNormalisableRange(range);
+}
+
+double FxEqualizer::FxBandCenterFreqSlider::snapValue(double attempted_value, DragMode)
+{
+    return jlimit(getMinimum(), getMaximum(), std::round(attempted_value));
+}
+
+void FxEqualizer::FxBandCenterFreqSlider::stepFrequency(int direction)
+{
+    // From the nearest whole hertz, so a fractional value (e.g. 62.5) steps to 63 / 62.
+    double current = getValue();
+    double target = jlimit(getMinimum(), getMaximum(), std::round(current) + (direction > 0 ? 1.0 : -1.0));
+    if (target != current)
+    {
+        setValue(target, NotificationType::sendNotificationSync);
+    }
+}
+
 void FxEqualizer::FxBandCenterFreqSlider::setFrequency(float value)
 {
     setValue(value, NotificationType::dontSendNotification);
 
-    String text;
     if (value > 0)
     {
-        int nBands = FxController::getInstance().getNumEqBands();
-
-        // ------------------------------------------------------ SET TEXT for bands >= 15
-        if (nBands >= 15)
-        {
-            if (value >= 10000)
-            {
-                text = String::formatted("%.0f\nkHz", value / 1000.0f);
-            }
-            else if (value >= 1000)
-            {
-                text = String::formatted("%.1f\nkHz", value / 1000.0f);
-            }
-            else
-            {
-                text = String::formatted("%.0f\nHz", value);
-            }            
-        }
-        else
-        {
-            if (value > 1000)
-            {
-                text = String::formatted("%.2f kHz", value / 1000.0f);
-            }
-            else
-            {
-                text = String::formatted("%.0f Hz", value);
-            }
-        }
-
-        freq_label_.setText(text, NotificationType::dontSendNotification);
+        // Bands >= 15 have narrow columns: number and unit on two lines.
+        bool two_lines = FxController::getInstance().getNumEqBands() >= 15;
+        freq_label_.setText(formatFrequency(value, two_lines ? "\n" : " "), NotificationType::dontSendNotification);
     }
 }
 
@@ -604,18 +716,19 @@ bool FxEqualizer::FxBandCenterFreqSlider::keyPressed(const KeyPress& key)
     {
         if (key.isKeyCode(KeyPress::upKey))
         {
-            setValue(getValue() + getInterval());
+            stepFrequency(1);
             return true;
         }
         else if (key.isKeyCode(KeyPress::downKey))
         {
-            setValue(getValue() - getInterval());
+            stepFrequency(-1);
             return true;
         }
     }
 
     return false;
 }
+
 // ------------------------------------------------------------------------------ SLIDERS FREQ - centered with right mouseDown
 void FxEqualizer::FxBandCenterFreqSlider::mouseDown(const juce::MouseEvent& event)
 {
@@ -639,20 +752,13 @@ void FxEqualizer::FxBandCenterFreqSlider::mouseDown(const juce::MouseEvent& even
 
 void FxEqualizer::FxBandCenterFreqSlider::resetToDefaultFrequency()
 {
-    int nBands = FxController::getInstance().getNumEqBands();
-
+    // GraphicEqGetDefaultBandFreq (via getDefaultEqBandFrequency) covers every band
+    // count the UI allows (5/10/15/20/31 - see FxController::setNumEqBands), so this
+    // always succeeds in practice; if it ever doesn't, leave the value unchanged
+    // rather than guess a frequency.
     float default_freq;
     if (FxController::getInstance().getDefaultEqBandFrequency(band_, &default_freq))
     {
         setValue(default_freq, juce::NotificationType::sendNotification);
-    }
-    else if (nBands > 1)
-    {
-        // nBands - 1 guarded above: with a single band there's no spacing to
-        // compute, so just fall through and leave the value unchanged.
-        float min_freq = 20;
-        float max_freq = 20000;
-        int f = min_freq * pow((max_freq / min_freq), ((float)band_ / (nBands - 1)));
-        setValue(f, juce::NotificationType::sendNotification);
     }
 }

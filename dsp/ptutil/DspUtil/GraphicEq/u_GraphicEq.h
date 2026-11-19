@@ -48,6 +48,9 @@ struct GraphicEqHdlType
 	realtype min_band_freq;
 	realtype max_band_freq;
 
+	/* 10 band layout: 0 = Standard, 1 = ISO (see GraphicEqSetIsoLayout). Reset to 0 when the band count changes. */
+	int iso_layout;
+
 	/* Filter Q setting */
 	realtype Q;
 	realtype Q_multiplier;

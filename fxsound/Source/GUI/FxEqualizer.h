@@ -81,6 +81,9 @@ private:
 
         void setFrequency(float value);
 
+        // The band's frequency range, on a linear dial.
+        void setFrequencyRange(float min_freq, float max_freq);
+
         void enablementChanged() override;
 
         void resetToDefaultFrequency();
@@ -89,10 +92,28 @@ private:
         void valueChanged() override;
         bool keyPressed(const KeyPress& key) override;
         void mouseDown(const juce::MouseEvent& event) override;
+        // Drags move in whole hertz. Values set from code (presets, the default frequency) keep their exact value.
+        double snapValue(double attempted_value, DragMode drag_mode) override;
+        // Moves 1 Hz up (direction > 0) or down (direction < 0), within the band's range. Used by the arrow keys.
+        void stepFrequency(int direction);
 
         Label& freq_label_;
 
         int band_;
+    };
+
+    // The "ISO Mode" toggle: a small outlined label drawn in the power button's colours, muted.
+    class FxIsoModeButton : public Button
+    {
+    public:
+        FxIsoModeButton();
+        ~FxIsoModeButton() = default;
+
+    private:
+        void paintButton(Graphics& g, bool highlighted, bool down) override;
+
+        static constexpr float FONT_HEIGHT = 11.0f;
+        static constexpr float CORNER_RADIUS = 3.0f;
     };
 
 	static constexpr int WIDTH = 776;
@@ -110,11 +131,26 @@ private:
 	void paint(Graphics& g) override;
 
     void updateTooltips(int num_bands);
+    // Re-reads every band's frequency range (it changes with the 10 band Standard / ISO layout) and frequency.
+    void refreshBandFrequencies();
+    // Shows the ISO toggle (10 bands only) in the controller's current layout.
+    void updateIsoButton();
 
 	std::vector<std::unique_ptr<Label>> labels_;
     std::vector<std::unique_ptr<FxEqSlider>> band_boosts_;
     std::vector<std::unique_ptr<FxBandCenterFreqSlider>> center_frequencies_;
     std::vector<float> band_gain_values_;
+
+    // 10 bands: switches between the Standard layout and the ISO layout (31, 62, 125 ... 16k).
+    FxIsoModeButton iso_button_;
+    // The layout the dials' ranges were last read for, so update() notices a change made by loading a preset.
+    bool iso_mode_shown_ = false;
+    // Top-left corner of the page; with 10 bands the sliders start ISO_BUTTON_GAP below it.
+    static constexpr int ISO_BUTTON_X = 6;
+    static constexpr int ISO_BUTTON_Y = 5;
+    static constexpr int ISO_BUTTON_WIDTH = 60;
+    static constexpr int ISO_BUTTON_HEIGHT = 15;
+    static constexpr int ISO_BUTTON_GAP = 4;
 
     bool highlight_mode_;
 
